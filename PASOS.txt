@@ -1,0 +1,27 @@
+✅ Resumen del flujo recomendado para evitar errores:
+
+-Definir espacio paramétrico completo
+
+-Crear motor de síntesis procedural básico
+
+-Integrar IA para generar parámetros
+
+-Construir UX / WebUI
+
+-Iterar y refinar
+
+
+Source/
+├── Params/          # Espacio paramétrico (enums, structs, variant)
+├── DSP/             # Utilidades DSP (oscillator, filter, envelope, noise, delay, saturator)
+├── SynthEngine/     # 10 sintetizadores + dispatcher + utils
+├── AI/              # ParameterGenerator + GenreRules (90 perfiles)
+├── Test/            # TestWavExporter
+├── WebViewPluginDemo.h  # AudioProcessor principal
+└── Main.cpp
+
+PROCESO:
+Empecé creando las directrices del proyecto
+Luego de las normas y visión del proyecto empecé a definir el espacio paramétrico completo
+Luego Cree el motor de síntesis procedural básico, y iba puliendo cada sonido con cada estilo hasta conseguir una carpeta de sonidos adjudicados a cada estilo y genero básicos que fueran de calidad a partir de  el motor de síntesis
+Estube tiempo para conseguir el sonido base de cada estilo

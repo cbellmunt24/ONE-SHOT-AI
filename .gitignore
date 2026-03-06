@@ -1,0 +1,39 @@
+# Python
+Training/venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Audio samples (too large for git)
+Training/libraries/**/*.wav
+Training/libraries/**/*.mp3
+Training/libraries/**/*.aif
+Training/libraries/**/*.aiff
+Training/libraries/**/*.flac
+
+# Generated data
+Training/data/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+
+# JUCE builds
+ONE-SHOT AI/Builds/
+ONE-SHOT AI/JuceLibraryCode/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Claude internal
+.claude/
