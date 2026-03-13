@@ -67,6 +67,18 @@ public:
         // Previo para two-point average
         float prevDelayed = 0.0f;
 
+        // --- FM synthesis oscillators ---
+        dsputil::Oscillator fmCarrier, fmModulator, fmCarrier2, fmModulator2;
+        fmCarrier.reset (0.0f);
+        fmModulator.reset (0.0f);
+        fmCarrier2.reset (0.25f);   // offset phase for detuned pair
+        fmModulator2.reset (0.25f);
+
+        fmCarrier.setFrequency (baseFreq, sr);
+        fmModulator.setFrequency (baseFreq * 2.0f, sr);  // mod ratio 2:1
+        fmCarrier2.setFrequency (baseFreq * 1.005f, sr);  // slight detune
+        fmModulator2.setFrequency (baseFreq * 3.0f * 1.01f, sr);  // mod ratio 3:1, detuned
+
         dsputil::DCBlocker dcL, dcR;
 
         for (int i = 0; i < numSamples; ++i)
@@ -100,7 +112,34 @@ public:
 
             delay.write (toWrite);
 
-            float sample = delayed;
+            float ksSample = delayed;
+
+            // --- FM synthesis layer ---
+            float fmSample = 0.0f;
+            if (p.fmAmount > 0.01f)
+            {
+                // FM index decays over time (bright attack -> mellow tail)
+                float fmIndex = p.fmAmount * 5.0f * std::exp (-t / std::max (p.decayTime * 0.7f, 0.01f));
+
+                // Modulator 1
+                float mod1 = fmModulator.next (OscillatorType::Sine);
+                // Carrier 1 with FM: phase deviation via frequency modulation
+                float fmDeviation = fmIndex * mod1 * baseFreq * 2.0f;
+                fmCarrier.setFrequency (baseFreq + fmDeviation, sr);
+                float fm1 = fmCarrier.next (OscillatorType::Sine);
+
+                // Second FM pair (detuned, softer) for richness
+                float mod2 = fmModulator2.next (OscillatorType::Sine);
+                float fmDeviation2 = fmIndex * 0.6f * mod2 * baseFreq * 3.0f;
+                fmCarrier2.setFrequency (baseFreq * 1.005f + fmDeviation2, sr);
+                float fm2 = fmCarrier2.next (OscillatorType::Sine);
+
+                float ampEnv = std::exp (-t / std::max (p.decayTime, 0.001f));
+                fmSample = (fm1 + fm2 * 0.4f) * ampEnv;
+            }
+
+            // Blend KS and FM
+            float sample = ksSample * (1.0f - p.fmAmount) + fmSample * p.fmAmount;
 
             // --- Body resonance ---
             if (p.bodyResonance > 0.01f)

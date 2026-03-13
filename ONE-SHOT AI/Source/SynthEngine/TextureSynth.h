@@ -95,9 +95,21 @@ public:
             nextGrainSample += grainIntervalSamples;
         }
 
-        // --- Renderizar granos con noise coloreado ---
+        // --- Pitched grain setup ---
+        float pitchedBaseFreq = 80.0f + p.pitch * 720.0f;
+
+        // Oscillators for pitched grains (one per grain, reused)
+        dsputil::Oscillator pitchedOsc;
+        pitchedOsc.reset (0.0f);
+
+        // --- Renderizar granos con noise coloreado + pitched ---
         for (const auto& g : grains)
         {
+            // Per-grain pitched oscillator: reset phase for each grain
+            float grainFreq = pitchedBaseFreq * g.pitch;  // pitch field used as detune
+            pitchedOsc.reset (grainDist (grainRng) * 0.5f + 0.5f);  // random start phase
+            pitchedOsc.setFrequency (grainFreq, sr);
+
             for (int j = 0; j < g.lengthSamples; ++j)
             {
                 int idx = g.startSample + j;
@@ -107,7 +119,14 @@ public:
                 float window = 0.5f * (1.0f - std::cos (dsputil::TWO_PI * windowPhase));
 
                 // Noise coloreado: brown/pink/white segun noiseColor del grano
-                float grain = noise.nextColored (g.noiseColor) * window;
+                float noiseGrain = noise.nextColored (g.noiseColor) * window;
+
+                // Pitched grain: sine oscillator windowed
+                float pitchedGrain = pitchedOsc.next (OscillatorType::Sine) * window;
+
+                // Blend noise and pitched based on pitchedness
+                float grain = (1.0f - p.pitchedness) * noiseGrain
+                            + p.pitchedness * pitchedGrain;
 
                 float L, R;
                 synthutil::panMonoToStereo (grain, g.pan, L, R);

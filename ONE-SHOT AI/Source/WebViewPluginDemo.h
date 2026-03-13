@@ -174,6 +174,37 @@ public:
                         #endif
                           )
     {
+#if USE_ONNX_INFERENCE
+        // Locate the Resources folder next to the plugin binary
+        auto pluginFile = juce::File::getSpecialLocation (juce::File::currentApplicationFile);
+        auto resourcesDir = pluginFile.getParentDirectory().getChildFile ("Resources");
+
+        // Fallback: walk up from the exe to find the project's Resources folder.
+        // Standalone: Builds/VisualStudio20XX/x64/Release/Standalone Plugin/exe
+        //   → 5 levels up = ONE-SHOT AI/ → Resources/
+        if (! resourcesDir.isDirectory())
+        {
+            auto dir = pluginFile.getParentDirectory();
+            for (int i = 0; i < 6 && ! resourcesDir.isDirectory(); ++i)
+            {
+                resourcesDir = dir.getChildFile ("Resources");
+                dir = dir.getParentDirectory();
+            }
+        }
+
+        if (resourcesDir.isDirectory())
+        {
+            bool loaded = paramGen.loadONNXModels (resourcesDir.getFullPathName().toStdString());
+            if (loaded)
+                DBG ("ONNX models loaded from: " + resourcesDir.getFullPathName());
+            else
+                DBG ("ONNX model loading failed: " + juce::String (paramGen.getONNXError()));
+        }
+        else
+        {
+            DBG ("Resources directory not found, using rule-based generation");
+        }
+#endif
     }
 
     //==============================================================================

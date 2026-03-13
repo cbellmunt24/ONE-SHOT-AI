@@ -25,6 +25,9 @@ desktop.ini
 *.user
 *.sln.docstates
 
+# Third-party libraries (download during setup)
+ONE-SHOT AI/ThirdParty/
+
 # JUCE builds
 ONE-SHOT AI/Builds/
 ONE-SHOT AI/JuceLibraryCode/

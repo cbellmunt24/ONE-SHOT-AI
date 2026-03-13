@@ -26,6 +26,8 @@ def load_all_optimized() -> dict:
     """Carga todos los parametros optimizados."""
     results = {}
     for f in sorted(OPTIMIZED_DIR.glob("*_optimized.json")):
+        if f.name.startswith("_"):
+            continue
         with open(f, 'r') as fp:
             data = json.load(fp)
         inst = data["instrument"]
@@ -79,7 +81,7 @@ def generate_genre_rules_header(optimized: dict, output_path: Path):
     lines.append("*/")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
 
     return len(lines)
@@ -126,7 +128,7 @@ def main():
 
     # Tambien exportar como JSON limpio
     json_path = TRAINING_DIR / "data" / "optimized_params" / "_all_optimized.json"
-    with open(json_path, 'w') as f:
+    with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(optimized, f, indent=2)
     print(f"JSON completo: {json_path}")
 

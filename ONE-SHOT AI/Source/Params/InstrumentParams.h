@@ -132,6 +132,7 @@ struct PluckParams
     float stringTension = 0.5f;     // 0..1, tensión de cuerda simulada
     float harmonics     = 0.3f;     // 0..1, contenido armónico
     float stereoWidth   = 0.3f;     // 0..1
+    float fmAmount      = 0.0f;     // 0..1, mezcla FM (0=Karplus-Strong puro, 1=FM dominante)
 };
 
 struct PadParams
@@ -166,4 +167,6 @@ struct TextureParams
     float noiseColor    = 0.5f;     // 0..1
     float stereoWidth   = 0.8f;     // 0..1
     float evolutionRate = 0.2f;     // Hz, velocidad de cambio
+    float pitchedness   = 0.0f;     // 0..1, mezcla de granos pitched (0=noise, 1=tonal)
+    float pitch         = 0.5f;     // 0..1, frecuencia base de granos pitched (80..800 Hz)
 };

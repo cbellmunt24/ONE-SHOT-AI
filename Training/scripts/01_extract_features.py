@@ -39,12 +39,23 @@ def find_audio_files(directory: Path) -> list:
     files = []
     if directory.exists():
         for f in directory.iterdir():
-            if f.suffix in extensions and f.is_file():
+            if f.suffix in extensions and f.is_file() and not f.name.startswith("._"):
                 files.append(f)
     return sorted(files)
 
 
-def process_instrument_genre(instrument: str, genre: str) -> dict:
+def _json_needs_update(path: Path) -> bool:
+    """Comprueba si un JSON existente necesita re-extraccion (sin windowed_features)."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return "windowed_features" not in data
+    except Exception:
+        return True
+
+
+def process_instrument_genre(instrument: str, genre: str,
+                              force_reextract: bool = False) -> dict:
     """Procesa todos los samples de un instrumento/genero."""
     sample_dir = LIBRARIES_DIR / instrument / genre
     audio_files = find_audio_files(sample_dir)
@@ -68,6 +79,14 @@ def process_instrument_genre(instrument: str, genre: str) -> dict:
 
     for audio_path in tqdm(audio_files, desc=f"    {instrument}/{genre}",
                            leave=False):
+        # Skip si ya existe el JSON de features (y tiene windowed_features)
+        output_path = output_dir / f"{audio_path.stem}.json"
+        if output_path.exists():
+            if not force_reextract or not _json_needs_update(output_path):
+                results["processed"] += 1
+                results["files"].append(audio_path.name)
+                continue
+
         try:
             features = extract_all_features(str(audio_path))
 
@@ -81,7 +100,6 @@ def process_instrument_genre(instrument: str, genre: str) -> dict:
             features["instrument"] = instrument
             features["genre"] = genre
 
-            output_path = output_dir / f"{audio_path.stem}.json"
             with open(output_path, 'w') as f:
                 json.dump(features, f, indent=2)
 
@@ -105,6 +123,8 @@ def main():
                         help="Procesar solo este instrumento")
     parser.add_argument("--genre", type=str, default=None,
                         help="Procesar solo este genero")
+    parser.add_argument("--force-reextract", action="store_true",
+                        help="Re-extraer JSONs que no tienen windowed_features")
     args = parser.parse_args()
 
     instruments = [args.instrument] if args.instrument else INSTRUMENTS
@@ -134,10 +154,11 @@ def main():
     # Procesar
     all_results = []
     for inst in instruments:
-        print(f"\n{'─' * 40}")
+        print(f"\n{'-' * 40}")
         print(f"Instrumento: {inst}")
         for genre in genres:
-            result = process_instrument_genre(inst, genre)
+            result = process_instrument_genre(inst, genre,
+                                                force_reextract=args.force_reextract)
             if not result.get("skipped"):
                 all_results.append(result)
 

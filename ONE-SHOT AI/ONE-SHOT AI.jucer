@@ -57,10 +57,18 @@
         <MODULEPATH id="juce_audio_processors_headless" path=""/>
       </MODULEPATHS>
     </XCODE_MAC>
-    <VS2022 targetFolder="Builds/VisualStudio2022" extraCompilerFlags="/bigobj">
+    <VS2022 targetFolder="Builds/VisualStudio2022" extraCompilerFlags="/bigobj"
+            extraDefs="USE_ONNX_INFERENCE=1"
+            extraLinkerFlags="onnxruntime.lib">
       <CONFIGURATIONS>
-        <CONFIGURATION name="Debug" isDebug="1" optimisation="1" targetName="WebViewPluginDemo"/>
-        <CONFIGURATION name="Release" isDebug="0" optimisation="3" targetName="WebViewPluginDemo"/>
+        <CONFIGURATION name="Debug" isDebug="1" optimisation="1" targetName="WebViewPluginDemo"
+                       headerPath="$(projectDir)\..\ThirdParty\onnxruntime\include"
+                       libraryPath="$(projectDir)\..\ThirdParty\onnxruntime\lib"
+                       postbuildCommand="xcopy /Y &quot;$(projectDir)\..\ThirdParty\onnxruntime\lib\onnxruntime.dll&quot; &quot;$(TargetDir)&quot;&#10;xcopy /Y &quot;$(projectDir)\..\ThirdParty\onnxruntime\lib\onnxruntime_providers_shared.dll&quot; &quot;$(TargetDir)&quot;"/>
+        <CONFIGURATION name="Release" isDebug="0" optimisation="3" targetName="WebViewPluginDemo"
+                       headerPath="$(projectDir)\..\ThirdParty\onnxruntime\include"
+                       libraryPath="$(projectDir)\..\ThirdParty\onnxruntime\lib"
+                       postbuildCommand="xcopy /Y &quot;$(projectDir)\..\ThirdParty\onnxruntime\lib\onnxruntime.dll&quot; &quot;$(TargetDir)&quot;&#10;xcopy /Y &quot;$(projectDir)\..\ThirdParty\onnxruntime\lib\onnxruntime_providers_shared.dll&quot; &quot;$(TargetDir)&quot;"/>
       </CONFIGURATIONS>
       <MODULEPATHS>
         <MODULEPATH id="juce_audio_basics" path=""/>
@@ -79,10 +87,18 @@
         <MODULEPATH id="juce_audio_processors_headless" path=""/>
       </MODULEPATHS>
     </VS2022>
-    <VS2026 targetFolder="Builds/VisualStudio2026" extraCompilerFlags="/bigobj">
+    <VS2026 targetFolder="Builds/VisualStudio2026" extraCompilerFlags="/bigobj"
+            extraDefs="USE_ONNX_INFERENCE=1"
+            extraLinkerFlags="onnxruntime.lib">
       <CONFIGURATIONS>
-        <CONFIGURATION name="Debug" isDebug="1" optimisation="1" targetName="WebViewPluginDemo"/>
-        <CONFIGURATION name="Release" isDebug="0" optimisation="3" targetName="WebViewPluginDemo"/>
+        <CONFIGURATION name="Debug" isDebug="1" optimisation="1" targetName="WebViewPluginDemo"
+                       headerPath="$(projectDir)\..\ThirdParty\onnxruntime\include"
+                       libraryPath="$(projectDir)\..\ThirdParty\onnxruntime\lib"
+                       postbuildCommand="xcopy /Y &quot;$(projectDir)\..\ThirdParty\onnxruntime\lib\onnxruntime.dll&quot; &quot;$(TargetDir)&quot;&#10;xcopy /Y &quot;$(projectDir)\..\ThirdParty\onnxruntime\lib\onnxruntime_providers_shared.dll&quot; &quot;$(TargetDir)&quot;"/>
+        <CONFIGURATION name="Release" isDebug="0" optimisation="3" targetName="WebViewPluginDemo"
+                       headerPath="$(projectDir)\..\ThirdParty\onnxruntime\include"
+                       libraryPath="$(projectDir)\..\ThirdParty\onnxruntime\lib"
+                       postbuildCommand="xcopy /Y &quot;$(projectDir)\..\ThirdParty\onnxruntime\lib\onnxruntime.dll&quot; &quot;$(TargetDir)&quot;&#10;xcopy /Y &quot;$(projectDir)\..\ThirdParty\onnxruntime\lib\onnxruntime_providers_shared.dll&quot; &quot;$(TargetDir)&quot;"/>
       </CONFIGURATIONS>
       <MODULEPATHS>
         <MODULEPATH id="juce_audio_basics" path=""/>

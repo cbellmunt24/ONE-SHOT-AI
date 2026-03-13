@@ -12,24 +12,139 @@ Llevar la calidad de generacion de one-shots al maximo nivel posible, usando lib
 
 | Fase | Estado | Notas |
 |------|--------|-------|
-| FASE 1: Setup | COMPLETADA | Estructura, scripts, venv, dependencias |
-| FASE 2: Cargar samples | PENDIENTE — usuario | Depositar .wav en Training/libraries/ |
-| FASE 3: Capa 1 — Features | PENDIENTE | Ejecutar 01 + 02 cuando haya samples |
-| FASE 4: Capa 2 — Optimization | PENDIENTE | Ejecutar 03 + 04 tras Capa 1 |
-| FASE 4.5: Diagnostico + Expansion | PENDIENTE | Analizar gaps, expandir params si necesario, re-optimizar |
-| FASE 5: Capa 3 — ML Model | PENDIENTE | Ejecutar 05 + 06 tras Capa 2 + 4.5 |
-| FASE 6: Mejoras avanzadas | PENDIENTE | Loss perceptual, mutaciones PCA, quality scoring, humanizacion |
+| FASE 1: Setup | ✅ COMPLETADA | Estructura, scripts, venv, dependencias |
+| FASE 2: Cargar samples | ✅ COMPLETADA | ~17,954 samples en 68/90 combinaciones |
+| FASE 3: Capa 1 — Features | ✅ COMPLETADA | 16,927 JSONs con features + windowed_features (2026-03-08) |
+| FASE 3.5: Perfiles | ✅ COMPLETADA | 02_build_profiles.py --plots ejecutado (2026-03-08) |
+| FASE 4: Capa 2 — Optimization (v3) | ✅ COMPLETADA | 86/87 combos, 0 NaN, params expandidos + synths mejorados (2026-03-09) |
+| FASE 4.5: Mutation Axes + Export | ✅ COMPLETADA | MutationAxes.h + GenreRules_calibrated.h (86 combos, 854 lineas) |
+| FASE 5: Capa 3 — ML Model | ✅ COMPLETADA | MLP 13,731 params, val_loss=0.000029, 1.28M filas dataset (2026-03-09) |
+| FASE 6: Export ONNX | ✅ COMPLETADA | oneshot_param_predictor.onnx (10.2KB), verificado diff=4.17e-07 |
+| FASE 7: Quality Scorer | ✅ COMPLETADA | 100% reales OK, 98% malos detectados, ONNX exportado |
+| FASE 8: Synth Engine Upgrades | ✅ COMPLETADA | Expansion params, TextureSynth/PluckSynth/PadSynth mejorados, ONNX en C++ |
+| FASE 9: Evolucion data-driven | ⏳ PENDIENTE | Auto-mejora del synth basada en datos extraidos |
 
-### Proximo paso
+### Resumen FASE 3 (completada 2026-03-08)
 
-1. Usuario deposita samples .wav en `Training/libraries/{instrumento}/{genero}/`
-2. Ejecutar Capa 1:
-   ```bash
-   cd Training
-   venv\Scripts\activate
-   python scripts/01_extract_features.py
-   python scripts/02_build_profiles.py --plots
-   ```
+**Extraccion de features:** 16,927 JSONs generados en `Training/data/features/`.
+
+**Todos los JSONs incluyen `windowed_features`** (5 ventanas: transient/attack/body/sustain/tail).
+- Se uso `01_extract_features.py` para la extraccion base
+- Se uso `01b_add_windowed_features.py` (script nuevo) para anadir windowed_features a los JSONs existentes sin re-extraer todas las features
+
+**Cobertura por instrumento (10 instrumentos, 68/90 combinaciones con samples):**
+- kicks: 8 generos — 2,128 JSONs
+- snares: 9 generos — 2,584 JSONs
+- hihats: 9 generos — 1,952 JSONs
+- claps: 9 generos — 1,006 JSONs
+- percs: 9 generos — 4,707 JSONs
+- 808s: 9 generos — 2,296 JSONs
+- leads: 9 generos — 2,141 JSONs (leads/edm: 1,356/1,592 por samples >10s)
+- plucks: 9 generos — 837 JSONs
+- pads: 9 generos — 759 JSONs
+- textures: 9 generos — 664 JSONs
+
+**Samples descartados:** ~500 por duracion >10s (no son one-shots), ~2 por errores de lectura
+
+### Incidencia pipeline (2026-03-08 → 2026-03-09)
+
+El pipeline anterior (run_pipeline.sh) ejecuto Fases 02→03→03b→04 pero:
+- **03_optimize_params.py** solo completo 808s (8 generos: afrobeat→techno). Se interrumpio en 808s/trap por apagado del PC.
+- **03b** solo proceso 808s (unico instrumento con datos).
+- **04** crasheo por bug UTF-8 (cp1252 en Windows). **Corregido** (encoding='utf-8').
+
+**Fixes aplicados (2026-03-09):**
+- Anadido `--skip-existing` a 03_optimize_params.py para reanudar sin repetir
+- Corregido UnicodeEncodeError en 04_export_genre_rules.py
+- Pipeline actualizado: 03 (skip-existing) → 03b → 04 → 05 → 06 → 07 (todo automatico)
+
+### Pipeline FULL completado (2026-03-09)
+
+`run_pipeline.sh` ejecuto automaticamente Fases 4→7:
+1. ✅ 03_optimize_params.py --skip-existing --diagnostics → 86 combos, 0 NaN
+2. ✅ 03b_learn_mutation_axes.py --export-cpp → MutationAxes.h
+3. ✅ 04_export_genre_rules.py → GenreRules_calibrated.h (854 lineas)
+4. ✅ 05_train_model.py --visualize → val_loss=0.000029, 1.28M filas
+5. ✅ 06_export_onnx.py --verify → 10.2KB, diff=4.17e-07
+6. ✅ 07_train_quality_scorer.py --export-onnx → 100% reales OK, 98% malos detectados
+
+**86/87 combinaciones optimizadas** (la unica sin samples: kicks/ambient)
+
+### Resultados Pipeline v3 — Distancias por instrumento (2026-03-09)
+
+| Instrumento | Params | Dist. Media | Mejor (dist) | Peor (dist) | Conv. | NaN |
+|-------------|--------|------------|--------------|-------------|-------|-----|
+| **808s** | 7 | 60.4 | ambient (27.7) | house (107.8) | 7/9 | 0 |
+| **kicks** | 8 | 89.5 | house (66.3) | hiphop (104.9) | 1/8 | 0 |
+| **percs** | 6 | 114.9 | house (81.5) | ambient (141.9) | 2/9 | 0 |
+| **plucks** | 6 | 150.4 | edm (73.7) | ambient (272.6) | 4/9 | 0 |
+| **claps** | 6 | 176.9 | edm (132.9) | ambient (269.8) | 0/9 | 0 |
+| **leads** | 7 | 181.8 | afrobeat (107.0) | ambient (300.5) | 5/9 | 0 |
+| **snares** | 7 | 191.1 | hiphop (138.1) | techno (347.9) | 2/9 | 0 |
+| **hihats** | 6 | 221.8 | rnb (155.4) | afrobeat (309.8) | 0/9 | 0 |
+| **textures** | 8 | 238.4 | edm (169.6) | house (417.8) | 0/9 | 0 |
+| **pads** | 8 | 300.8 | edm (104.7) | rnb (462.3) | 1/6 | 0 |
+
+**Evolucion v1 → v2 → v3:** Total NaN: 9 → 9 → 0. Mejoras significativas en textures (-24%), plucks (-74%), 808s (-52%).
+
+### Archivos generados (pipeline completo)
+
+```
+Training/data/
+  features/              16,927 JSONs con features + windowed_features
+  profiles/              87 perfiles estadisticos
+  optimized_params/      86 JSONs con parametros optimos (v3)
+  mutation_axes/         PCA axes + MutationAxes.h
+  dataset/
+    training_data.npz              1,285,582 filas
+    quality_scorer_data.npz        18,287 filas
+  models/
+    oneshot_param_predictor.pt     Modelo PyTorch (MLP)
+    oneshot_param_predictor.onnx   Modelo ONNX para C++ (10.2KB)
+    quality_scorer.pt              Quality scorer PyTorch
+    quality_scorer.onnx            Quality scorer ONNX
+    feature_space_map.png          Mapa PCA del espacio de parametros
+  GenreRules_calibrated.h          Header C++ (854 lineas)
+
+ONE-SHOT AI/
+  Resources/
+    oneshot_param_predictor.onnx   Copiado para el plugin
+    quality_scorer.onnx            Copiado para el plugin
+  Source/AI/
+    GenreRules.h                   Reemplazado con version ML-calibrada
+    MutationAxes.h                 Ejes de mutacion PCA
+    ParameterGenerator.h           Inferencia ONNX + fallback a reglas
+  Source/SynthEngine/
+    TextureSynth.h                 Pitched grains
+    PluckSynth.h                   FM synthesis
+  Source/Params/
+    InstrumentParams.h             Nuevos params expandidos
+```
+
+### Mejoras avanzadas integradas en scripts (2026-03-08)
+
+Todas las mejoras de FASE 6 ya estan implementadas en los scripts base:
+
+| Mejora | Script | Estado |
+|--------|--------|--------|
+| Multi-resolucion temporal | `utils/audio_features.py` | IMPLEMENTADA — `extract_windowed_features()` con 5 ventanas (transient/attack/body/sustain/tail) |
+| Loss perceptual (Mel, ISO 226, masking) | `03_optimize_params.py` | IMPLEMENTADA — `perceptual_timbral_distance()` reemplaza la distancia basica |
+| Multi-resolucion en distancia | `03_optimize_params.py` | IMPLEMENTADA — usa windowed_features si existen, con pesos 0.30/0.25/0.25/0.10/0.10 |
+| Diagnostico de gaps | `03_optimize_params.py` | IMPLEMENTADO — flag `--diagnostics`, genera `gap_report.json` |
+| Mutaciones PCA | `03b_learn_mutation_axes.py` | NUEVO SCRIPT — aprende ejes de mutacion correlacionados, exporta a C++ |
+| Feature-space morphing | `05_train_model.py` | IMPLEMENTADA — interpolacion cross-genero en dataset, `--visualize` para PCA map |
+| Quality scorer | `07_train_quality_scorer.py` | NUEVO SCRIPT — MLP que puntua calidad 0-1, exporta ONNX |
+
+**NOTA:** Todos los 16,927 JSONs ya incluyen `windowed_features` (anadidos via 01b_add_windowed_features.py).
+
+### Fixes aplicados en FASE 3 (2026-03-06)
+
+- `fmin=20` → `fmin=22` en librosa.pyin (incompatible con frame_length=2048 a 44100Hz)
+- Proteccion contra `np.nanargmax` en slices all-NaN (samples sin pitch claro)
+- Filtro de duracion maxima: samples >10s se saltan (no son one-shots)
+- Filtro de archivos `._` de macOS (metadatos, no audio)
+- Caracter Unicode `─` → `-` (incompatible con cp1252 en Windows)
+- Optimizacion: pyin se llama 1 vez por sample en vez de 3 (~3x speedup)
 
 ### Entorno Python
 
@@ -562,44 +677,84 @@ Audio de alta calidad calibrado contra samples reales
 FASE 1: Setup                                              ✅ COMPLETADA
   ├─ Crear estructura Training/                             ✅
   ├─ 90 carpetas libraries/{inst}/{genero}/                 ✅
-  ├─ 6 scripts + 4 utils escritos                           ✅
+  ├─ 7 scripts + 4 utils escritos                           ✅
   ├─ venv Python 3.10 creado                                ✅
   └─ Todas las dependencias instaladas                      ✅
 
-FASE 2: Cargar librerias (usuario)                         ⏳ PENDIENTE
-  └─ Copiar samples .wav a Training/libraries/{inst}/{genero}/
+FASE 2: Cargar librerias (usuario)                         ✅ COMPLETADA
+  ├─ ~17,954 samples .wav cargados                          ✅
+  ├─ 68/90 combinaciones cubiertas                          ✅
+  └─ 22 combinaciones vacias (melodicos en house/techno/afrobeat/rnb + kicks/ambient)
 
-FASE 3: Capa 1 — Feature Extraction                        ⏳ PENDIENTE
-  ├─ python scripts/01_extract_features.py    → features por sample
-  └─ python scripts/02_build_profiles.py --plots → perfiles + graficas
+FASE 3: Capa 1 — Feature Extraction                        ✅ COMPLETADA (2026-03-08)
+  ├─ 01_extract_features.py → 16,927 JSONs                  ✅
+  ├─ 01b_add_windowed_features.py → windowed_features       ✅
+  └─ 02_build_profiles.py --plots → 87 perfiles             ✅
 
-FASE 4: Capa 2 — Optimization                             ⏳ PENDIENTE
-  ├─ Synth bridge Python ya implementado (Opcion B)
-  ├─ python scripts/03_optimize_params.py --export-audio → params optimizados
-  ├─ python scripts/04_export_genre_rules.py  → nuevo GenreRules.h
-  └─ Integrar en plugin, testear, iterar
+FASE 4: Capa 2 — Optimization (v3)                         ✅ COMPLETADA (2026-03-09)
+  ├─ synth_bridge.py: 10 generadores con params expandidos  ✅ (5-8 params por instrumento)
+  ├─ 03_optimize_params.py v3: 86/87 combos, 0 NaN          ✅
+  ├─ extract_features_fast: 9.3x speedup vs extract_all     ✅
+  ├─ Fix std=0: max(std, 0.1 * max(abs(mean), 1.0))         ✅
+  └─ NaN guards en distancias timbrica y perceptual          ✅
 
-FASE 4.5: Diagnostico + Expansion de parametros            ⏳ PENDIENTE
-  ├─ Analizar gap_report.json generado en FASE 4
-  ├─ Si hay gaps ALTOS (distancia > 0.6):
-  │   ├─ Expandir synth_bridge.py con nuevos parametros DSP
-  │   ├─ Expandir SynthEngine C++ con DSP correspondiente
-  │   ├─ Re-ejecutar 03_optimize_params.py (iterar hasta distancia < 0.4)
-  │   └─ Re-exportar 04_export_genre_rules.py con params expandidos
-  └─ Si todos OK (distancia < 0.4): proceder a FASE 5
+FASE 4.5: Mutation Axes + Export                           ✅ COMPLETADA (2026-03-09)
+  ├─ 03b_learn_mutation_axes.py → PCA por instrumento        ✅
+  ├─ MutationAxes.h generado para C++                        ✅
+  ├─ 04_export_genre_rules.py → GenreRules_calibrated.h      ✅ (854 lineas, 86 combos)
+  └─ Backup params v1 en Training/data/optimized_params_old_backup/ ✅
 
-FASE 5: Capa 3 — ML Model (opc1ional, despues de validar Capa 2 + 4.5)  ⏳ PENDIENTE
-  ├─ python scripts/05_train_model.py         → modelo entrenado
-  ├─ python scripts/06_export_onnx.py --verify → .onnx
-  └─ Integrar MLParameterGenerator.h en plugin
+FASE 5: Capa 3 — ML Model                                 ✅ COMPLETADA (2026-03-09)
+  ├─ 05_train_model.py → MLP 13,731 params                  ✅
+  ├─ val_loss=0.000029, 1,285,582 filas dataset              ✅
+  ├─ Feature-space morphing (interpolacion cross-genero)     ✅
+  └─ feature_space_map.png generado                          ✅
 
-FASE 6: Mejoras avanzadas de calidad y mutaciones              ⏳ PENDIENTE
-  ├─ 6a. Multi-resolucion temporal en 01_extract_features.py
-  ├─ 6b. Loss perceptual (mel, loudness, masking) en 03_optimize_params.py
-  ├─ 6c. Ejes de mutacion PCA → nuevo 03b_learn_mutation_axes.py
-  ├─ 6d. Quality scorer → nuevo 07_train_quality_scorer.py
-  ├─ 6e. Perfiles de mutacion y humanizacion → modificar ParameterGenerator.h
-  └─ 6f. Feature-space morphing → modificar 05_train_model.py
+FASE 6: Export ONNX                                        ✅ COMPLETADA (2026-03-09)
+  ├─ 06_export_onnx.py → oneshot_param_predictor.onnx        ✅ (10.2KB)
+  └─ Verificacion: diff PyTorch vs ONNX = 4.17e-07           ✅
+
+FASE 7: Quality Scorer                                     ✅ COMPLETADA (2026-03-09)
+  ├─ 07_train_quality_scorer.py → quality_scorer.onnx        ✅
+  ├─ 100% reales clasificados OK                             ✅
+  ├─ 98% malos detectados                                    ✅
+  └─ 18,287 filas dataset scorer                             ✅
+
+FASE 8: Synth Engine Upgrades + Integracion C++            ✅ COMPLETADA (2026-03-09)
+  ├─ Expansion de parametros:                                ✅
+  │   ├─ synth_bridge.py: 10 generadores con params expandidos
+  │   ├─ 03_optimize_params.py: PARAM_BOUNDS expandidos
+  │   ├─ 05_train_model.py: PARAM_BOUNDS y modulate_params actualizados
+  │   └─ 07_train_quality_scorer.py: PARAM_BOUNDS actualizados
+  ├─ Mejora de sintetizadores:                               ✅
+  │   ├─ TextureSynth.h: pitched grains (dist 312→238, -24%)
+  │   ├─ PluckSynth.h: FM synthesis (dist 156→150)
+  │   └─ PadSynth.h: evolutionRate LFO (dist 272→301, regresion menor)
+  ├─ Integracion C++:                                        ✅
+  │   ├─ ONNX models copiados a ONE-SHOT AI/Resources/
+  │   ├─ GenreRules.h reemplazado con version ML-calibrada
+  │   ├─ MutationAxes.h integrado en Source/AI/
+  │   ├─ ParameterGenerator.h con inferencia ONNX (#if USE_ONNX_INFERENCE)
+  │   ├─ InstrumentParams.h actualizado con nuevos params
+  │   └─ Fallback automatico a reglas si ONNX no disponible
+  └─ Pipeline v1→v2→v3 completado: 0 NaN, val_loss mejorado ✅
+
+FASE 9: Mejoras futuras                                    ⏳ PENDIENTE
+  ├─ 9a. Compilar con onnxruntime (definir USE_ONNX_INFERENCE)
+  ├─ 9b. Test auditivo de sonidos generados
+  ├─ 9c. Mejorar PadSynth (dist 301, la peor)
+  ├─ 9d. Recopilar mas samples (22 combos vacias)
+  ├─ 9e. Optimizar ambient (peor genero en plucks/leads/claps)
+  ├─ 9f. Nuevos modulos DSP pendientes:
+  │   ├─ Wavetable Oscillator
+  │   ├─ Transient Shaper dedicado
+  │   ├─ Multiband Processing
+  │   ├─ Mid/Side Stereo Processing
+  │   ├─ Comb Filter (resonancias metalicas)
+  │   └─ Oversampling global (2x/4x)
+  ├─ 9g. Evolucion data-driven (auto-mejora del synth)
+  ├─ 9h. Batch Export (packs de variaciones WAV)
+  └─ 9i. Seed Interpolation (morph entre 2 seeds)
 ```
 
 ---
@@ -615,18 +770,34 @@ venv\Scripts\activate
 python scripts/01_extract_features.py                       # todas las librerias
 python scripts/01_extract_features.py --instrument kicks    # solo kicks
 python scripts/01_extract_features.py --instrument kicks --genre trap  # solo kicks/trap
+python scripts/01_extract_features.py --force-reextract     # re-extraer con windowed_features
 python scripts/02_build_profiles.py --plots                 # perfiles + graficas
 
 # Capa 2
 python scripts/03_optimize_params.py                        # optimizar todos
 python scripts/03_optimize_params.py --instrument kicks --genre trap --maxiter 100
 python scripts/03_optimize_params.py --export-audio         # + wav de ejemplo
+python scripts/03_optimize_params.py --diagnostics          # + gap_report.json
 python scripts/04_export_genre_rules.py                     # generar .h calibrado
 
+# Mutaciones PCA
+python scripts/03b_learn_mutation_axes.py                   # aprender ejes PCA
+python scripts/03b_learn_mutation_axes.py --export-cpp      # + MutationAxes.h
+
 # Capa 3
-python scripts/05_train_model.py --epochs 200               # entrenar MLP
+python scripts/05_train_model.py --epochs 200               # entrenar MLP (con morphing)
+python scripts/05_train_model.py --no-morphing              # sin interpolacion cross-genero
+python scripts/05_train_model.py --visualize                # + feature_space_map.png
 python scripts/05_train_model.py --generate-dataset-only    # solo generar dataset
 python scripts/06_export_onnx.py --verify                   # exportar + verificar
+
+# Quality Scorer
+python scripts/07_train_quality_scorer.py                   # entrenar scorer
+python scripts/07_train_quality_scorer.py --export-onnx     # + quality_scorer.onnx
+
+# Evolucion del synth (FASE 8, cuando exista)
+# python scripts/08_synth_evolution.py                      # analisis de gaps + report
+# python scripts/09_generate_params_h.py                    # generar codigo C++ expandido
 ```
 
 ---
@@ -906,6 +1077,341 @@ Todas estas mejoras se integran en los scripts existentes:
   - Mejora 4        → nuevo script 07_train_quality_scorer.py
   - Mejoras 5, 6    → modificar ParameterGenerator.h (C++)
   - Mejora 7        → modificar 05_train_model.py (dataset con interpolaciones)
+```
+
+---
+
+## FASE 7 — Synth Engine Upgrades (Nuevos modulos DSP en C++)
+
+### Objetivo
+Expandir las capacidades del motor de sintesis para cubrir timbres que el sistema actual no puede alcanzar. Estas mejoras se priorizan segun los gaps detectados en FASE 4.5/8.
+
+### 7a. Wavetable Oscillator
+
+**Problema:** Solo Sine/Saw/Square/Triangle/Noise. Timbres limitados para leads, pads, textures.
+
+**Solucion:**
+```
+Nuevo modulo: WavetableOscillator.h
+- 256-sample frames, 8-16 wavetables predefinidas
+- Categorias: vocal, digital, analog, organic, metallic, glass, formant, evolving
+- Morph continuo entre frames (crossfade interpolado)
+- Anti-aliasing via oversampling del lookup
+- Integracion: LeadSynth, PadSynth, TextureSynth, Bass808Synth
+- Nuevo param: wavetableIndex (0..15), wavetableMorph (0..1)
+```
+
+### 7b. Transient Shaper
+
+**Problema:** El transiente depende solo del envelope + saturation. No hay control preciso del "punch".
+
+**Solucion:**
+```
+Nuevo modulo: TransientShaper.h
+- Detector de envolvente (attack/release separados)
+- Split señal en transient + sustain
+- Gain independiente para cada componente
+- Params: transientGain (-12..+12 dB), sustainGain (-12..+12 dB), sensitivity
+- Se puede integrar por instrumento o como efecto en cadena
+- Afecta: kicks, snares, percs, claps (especialmente)
+```
+
+### 7c. FM/PM Synthesis
+
+**Problema:** No hay sintesis FM. Timbres metalicos y campanas imposibles.
+
+**Solucion:**
+```
+Nuevo modulo: FMOperator.h
+- 1 operador modulador con ratio + depth
+- Ratio: 0.5..16.0 (subharmonico a inharmonico)
+- Depth: 0..1000 Hz de desviacion
+- Envelope sobre depth para timbres evolutivos
+- Integracion: PercSynth (metallic), HiHatSynth (realismo), LeadSynth (FM bass)
+- Nuevo param: fmRatio, fmDepth, fmDecay
+```
+
+### 7d. Multiband Processing
+
+**Problema:** Compresion y saturacion son de banda completa. No se puede comprimir graves sin afectar agudos.
+
+**Solucion:**
+```
+Nuevo modulo: MultibandProcessor.h
+- Split en 3 bandas: low (<250Hz), mid (250-4000Hz), high (>4000Hz)
+- Crossover con Linkwitz-Riley (24dB/oct, fase lineal en suma)
+- Por banda: gain, compresion, saturacion
+- Especialmente util para 808s (distorsion solo en mids) y mastering
+- Nuevo efecto en EffectChain o reemplazo de Compressor+EQ
+```
+
+### 7e. Mid/Side Stereo Processing
+
+**Problema:** Solo pan y stereo width basico. No hay control M/S real.
+
+**Solucion:**
+```
+Nuevo modulo: MidSideProcessor.h
+- Encode: M = (L+R)/2, S = (L-R)/2
+- Procesamiento independiente: mid_gain, side_gain, side_highpass
+- side_highpass: mono por debajo de X Hz (tipico 200-300Hz)
+- Haas effect: micro-delay en un canal (0.5-20ms) para anchura
+- Integracion: SynthEngine master chain, despues de EffectChain
+- Params: midGain, sideGain, sideHighpass, stereoEnhance
+```
+
+### 7f. Modulacion expandida
+
+**Problema:** Solo 1 LFO por instrumento. Modulacion limitada.
+
+**Solucion:**
+```
+Expandir Envelope.h + Oscillator.h:
+- 2o LFO con destinos independientes (filtro, amplitud, pitch, pan)
+- Envelope Follower: la amplitud modula otro parametro
+- Sample & Hold random: modulacion escalonada aleatoria
+- Params: lfo2Rate, lfo2Depth, lfo2Dest, envFollowAmount, envFollowDest
+- Afecta: BaseSoundParams (todos los instrumentos lo heredan)
+```
+
+### 7g. Comb Filter
+
+**Problema:** Solo existe en el reverb. No disponible como modulo de sintesis.
+
+**Solucion:**
+```
+Nuevo modulo: CombFilter.h (feedback + feedforward)
+- Frecuencia de resonancia: 50-5000 Hz
+- Feedback: -1..+1 (negativo = filtro peine invertido)
+- Damping: filtro LP en el feedback loop
+- Uso: resonancias metalicas (hihats, percs), Karplus-Strong mejorado (plucks)
+- Params: combFreq, combFeedback, combDamping
+```
+
+### 7h-7j. Mejoras adicionales
+
+```
+7h. Oversampling global: 2x/4x configurable para todo SynthEngine
+    - Reduce aliasing en saturadores internos de cada synth
+    - Toggle en UI: "HQ Mode" on/off
+
+7i. Batch Export:
+    - Generar N variaciones de un preset en un click
+    - WAV 16/24/32 bit seleccionable
+    - Auto-naming: {instrumento}_{genero}_{seed}.wav
+
+7j. Seed Interpolation:
+    - Interpolar suavemente entre 2 GenerationResults
+    - Slider "morph" que blendea params: p = alpha*p1 + (1-alpha)*p2
+```
+
+### Orden de implementacion FASE 7
+
+```
+Prioridad ALTA (necesarios para cerrar gaps timbricos):
+  7a. Wavetable Oscillator    — leads y pads necesitan mas variedad timbrica
+  7b. Transient Shaper        — percusion necesita mas punch controlable
+  7c. FM Synthesis             — metalicos/campanas imposibles sin FM
+
+Prioridad MEDIA (mejoran calidad general):
+  7d. Multiband Processing    — mixing mas profesional
+  7e. Mid/Side Processing     — imagen estereo profesional
+  7f. Modulacion expandida    — sonidos mas vivos y expresivos
+
+Prioridad BAJA (nice-to-have):
+  7g. Comb Filter             — nicho pero util
+  7h. Oversampling global     — calidad vs CPU
+  7i. Batch Export             — workflow
+  7j. Seed Interpolation       — creativo
+```
+
+---
+
+## FASE 8 — Evolucion Data-Driven del Sintetizador
+
+### Objetivo
+Usar los datos extraidos de las librerias reales para que el sistema se auto-mejore: detectar que le falta al sintetizador, proponer expansiones, y iterar automaticamente hasta alcanzar calidad profesional.
+
+### Principio fundamental
+**El pipeline de ML no solo calibra el synth actual — lo EVOLUCIONA.** Los datos de features reales son el "ground truth" de como DEBE sonar. Si el synth no puede alcanzarlos, los datos dicen exactamente QUE falta y POR QUE.
+
+### 8a. Analisis de gaps timbricos sistematico
+
+```
+Script: 08_synth_evolution.py
+
+Proceso:
+1. Cargar features de TODOS los samples reales
+2. Cargar features del MEJOR audio sintetizado (tras optimizacion FASE 4)
+3. Para cada instrumento/genero, comparar distribucion real vs sintetizada:
+   - Para cada feature: real_range vs synth_range
+   - Si real_max > synth_max * 1.2 → el synth no PUEDE llegar ahi
+   - Si real_std > synth_std * 2.0 → el synth no tiene suficiente VARIABILIDAD
+
+4. Mapear gaps a modulos DSP faltantes:
+   ┌─────────────────────────────────┬───────────────────────────────────────┐
+   │ Gap detectado                   │ Modulo DSP necesario                  │
+   ├─────────────────────────────────┼───────────────────────────────────────┤
+   │ spectral_centroid inalcanzable  │ Wavetable + filtros mas agresivos     │
+   │ harmonic_ratio muy bajo         │ FM synthesis + waveshaping            │
+   │ transient_sharpness insuficiente│ Transient shaper                      │
+   │ noise_ratio fuera de rango      │ Noise generator expandido + coloring  │
+   │ pitch_contour no reproducible   │ Pitch envelope multi-segmento         │
+   │ spectral_flatness no alcanzable │ Granular / noise mixing mejorado      │
+   │ warmth_index fuera de rango     │ Sub-harmonics + filtro ladder          │
+   │ stereo_width insuficiente       │ Mid/Side + Haas effect                │
+   │ brightness_index inalcanzable   │ Exciter / harmonic enhancer           │
+   │ zero_crossing_rate fuera rango  │ Bitcrusher interno / sample reduction │
+   └─────────────────────────────────┴───────────────────────────────────────┘
+
+5. Output: synth_evolution_report.json
+   {
+     "kicks": {
+       "gaps": [...],
+       "suggested_modules": ["TransientShaper", "SubHarmonics"],
+       "new_params_needed": ["transientGain", "subPhase", "subHarmonics"],
+       "estimated_improvement": 0.35,
+       "priority": "ALTA"
+     },
+     ...
+   }
+```
+
+### 8b. Expansion automatica de parametros
+
+```
+Basandose en synth_evolution_report.json:
+
+1. Para cada instrumento con gaps:
+   - Generar nuevos bounds para PARAM_BOUNDS en 03_optimize_params.py
+   - Generar nuevos params para synth_bridge.py (Python)
+   - Generar spec de nuevos params para InstrumentParams.h (C++)
+
+2. Ejemplo: si kicks necesita TransientShaper:
+   PARAM_BOUNDS["kicks"] += [
+     ("transientGain",  -12.0, 12.0),
+     ("sustainGain",    -12.0, 12.0),
+     ("transientSens",  0.0,   1.0),
+   ]
+   → Total params kick: 8 → 11
+
+3. El synth_bridge.py se actualiza para simular el nuevo DSP
+4. Se re-ejecuta la optimizacion con los nuevos params
+```
+
+### 8c. Generacion de codigo C++
+
+```
+Script: 09_generate_params_h.py
+
+1. Leer synth_evolution_report.json
+2. Para cada instrumento modificado:
+   - Generar nuevo struct XxxParams con campos adicionales
+   - Generar entradas para ParameterGenerator.h
+   - Generar shell del nuevo modulo DSP (.h con TODO markers)
+3. Output:
+   - InstrumentParams_v2.h (structs actualizados)
+   - ParameterGenerator_v2.h (generador actualizado)
+   - Stubs de nuevos modulos DSP
+4. Diff respecto a la version actual para review manual
+```
+
+### 8d. Ciclo de re-optimizacion iterativa
+
+```
+Bucle automatico:
+
+ITER 0: Synth original
+  → Extraer features, optimizar, medir distancia
+  → gap_report: 15/68 combinaciones con distancia > 0.6
+
+ITER 1: Synth + TransientShaper + FM
+  → Re-optimizar con nuevos params
+  → gap_report: 5/68 combinaciones con distancia > 0.6
+  → Mejora: 67% de gaps cerrados
+
+ITER 2: Synth + todo lo anterior + Wavetable
+  → Re-optimizar
+  → gap_report: 1/68 combinaciones con distancia > 0.6
+  → Mejora: 93% de gaps cerrados
+
+ITER 3: Fine-tuning
+  → Distancia < 0.3 para 95% de combinaciones → CONVERGIDO
+
+Criterio de parada:
+  - distancia < 0.3 para el 90% de combinaciones, O
+  - mejora < 5% respecto a iteracion anterior, O
+  - maximo 5 iteraciones
+```
+
+### 8e. Aprendizaje de rangos de humanizacion
+
+```
+Extraido directamente de los datos de features:
+
+Para cada instrumento/genero, calcular std de features clave:
+  kicks/trap:
+    std(attack_time_ms) = 0.8 → humanize_timing sigma = 0.8ms
+    std(spectral_centroid) = 38 → humanize_timbre sigma = 38Hz
+    std(crest_factor) = 1.5 → humanize_dynamics sigma = 1.5
+
+Exportar como HumanizationProfiles.h:
+  struct HumanizationProfile {
+    float timingSigmaMs;
+    float pitchSigmaCents;
+    float timbreSigmaHz;
+    float dynamicsSigma;
+  };
+
+  HumanizationProfile getProfile("kicks", "trap") {
+    return { 0.8f, 2.1f, 38.0f, 1.5f };
+  }
+
+→ El parametro "Humanize" del UI escala estos sigmas:
+  0% = sin variacion, 100% = variacion natural real
+```
+
+### 8f. Modelo predictivo de mejoras DSP
+
+```
+Fase avanzada (opcional):
+Entrenar un modelo que prediga si un modulo DSP mejoraria un instrumento.
+
+Input: (instrumento_one_hot, feature_gaps[], gap_magnitudes[])
+Output: (modulo_DSP_id, impacto_estimado, confianza)
+
+Training data: historial de iteraciones del ciclo 8d
+  - ITER 0 gaps + modulo anadido en ITER 1 + mejora obtenida
+  - ITER 1 gaps + modulo anadido en ITER 2 + mejora obtenida
+  - etc.
+
+Esto permite priorizar automaticamente que modulo implementar primero
+cuando hay multiples gaps simultaneos.
+```
+
+### Orden de ejecucion FASE 7 + 8
+
+```
+La FASE 7 y 8 se entrelazan:
+
+[FASE 4 completada] → Tenemos gap_report.json
+    ↓
+[FASE 8a] Analizar gaps → synth_evolution_report.json
+    ↓
+[FASE 7: implementar modulos DSP priorizados por 8a]
+  Solo los que el reporte indica como necesarios:
+  ej: si kicks necesita transient shaper → implementar 7b
+  ej: si leads necesita wavetable → implementar 7a
+    ↓
+[FASE 8b] Expandir params automaticamente
+    ↓
+[FASE 8d] Re-optimizar con synth expandido
+    ↓
+[FASE 8a de nuevo] Revisar gaps → ¿quedan gaps?
+  SI → volver a FASE 7 (siguiente modulo)
+  NO → FASE 8e (humanizacion) → FASE 8c (generar codigo final)
+    ↓
+[Integrar en plugin C++]
 ```
 
 ---

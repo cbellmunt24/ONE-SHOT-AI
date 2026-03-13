@@ -3,17 +3,86 @@
 #include <random>
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include "../Params/SynthParams.h"
 #include "GenreRules.h"
+#include "MutationAxes.h"
 
-// Generador de parámetros basado en reglas musicales (Opción A).
+// ================================================================
+// ONNX Runtime inference support (conditional compilation)
+// Define USE_ONNX_INFERENCE=1 and link onnxruntime to enable.
+// Without it, the plugin uses rule-based generation as fallback.
+// ================================================================
+#if USE_ONNX_INFERENCE
+  #include <onnxruntime_cxx_api.h>
+  #include <memory>
+  #include <vector>
+  #ifdef _WIN32
+    #include <Windows.h>
+  #endif
+#endif
+
+// Generador de parámetros basado en reglas musicales (Opción A) con
+// soporte opcional para inferencia ONNX (Opción B).
 // Toma un GenerationRequest del UX y produce un GenerationResult
 // con parámetros coherentes, únicos y listos para el motor de síntesis.
-// Diseñado para ser reemplazable por un modelo ML en el futuro.
 
 class ParameterGenerator
 {
 public:
+
+#if USE_ONNX_INFERENCE
+    // ================================================================
+    // ONNX MODEL LOADING
+    // ================================================================
+
+    // Call once at startup with the path to the Resources folder.
+    // Returns true if models loaded successfully.
+    bool loadONNXModels (const std::string& resourcesPath)
+    {
+        try
+        {
+            Ort::SessionOptions sessionOptions;
+            sessionOptions.SetIntraOpNumThreads (1);
+            sessionOptions.SetGraphOptimizationLevel (GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+            std::string paramModelPath = resourcesPath + "/oneshot_param_predictor.onnx";
+            std::string qualityModelPath = resourcesPath + "/quality_scorer.onnx";
+
+            // Wide string conversion for Windows (handles UTF-8 and special chars)
+            #ifdef _WIN32
+                auto toWide = [] (const std::string& s) -> std::wstring {
+                    if (s.empty()) return {};
+                    int needed = MultiByteToWideChar (CP_UTF8, 0, s.c_str(), (int) s.size(), nullptr, 0);
+                    std::wstring ws (needed, 0);
+                    MultiByteToWideChar (CP_UTF8, 0, s.c_str(), (int) s.size(), ws.data(), needed);
+                    return ws;
+                };
+                paramSession = std::make_unique<Ort::Session> (env, toWide (paramModelPath).c_str(), sessionOptions);
+                qualitySession = std::make_unique<Ort::Session> (env, toWide (qualityModelPath).c_str(), sessionOptions);
+            #else
+                paramSession = std::make_unique<Ort::Session> (env, paramModelPath.c_str(), sessionOptions);
+                qualitySession = std::make_unique<Ort::Session> (env, qualityModelPath.c_str(), sessionOptions);
+            #endif
+
+            onnxAvailable = true;
+            return true;
+        }
+        catch (const Ort::Exception& e)
+        {
+            onnxAvailable = false;
+            onnxLoadError = e.what();
+            return false;
+        }
+    }
+
+    bool isONNXAvailable() const { return onnxAvailable; }
+    const std::string& getONNXError() const { return onnxLoadError; }
+#endif
+
+    // ================================================================
+    // MAIN GENERATE — dispatches to ONNX or rule-based
+    // ================================================================
     GenerationResult generate (const GenerationRequest& req, unsigned int seed = 0)
     {
         if (seed == 0)
@@ -26,6 +95,24 @@ public:
         GenerationResult result;
         result.instrument = req.instrument;
 
+#if USE_ONNX_INFERENCE
+        if (onnxAvailable)
+        {
+            // Try ONNX inference, fall back to rules on failure
+            try
+            {
+                result.params = generateFromONNX (req, rng);
+                result.effects = generateEffects (req, rng);
+                return result;
+            }
+            catch (...)
+            {
+                // Fall through to rule-based generation
+            }
+        }
+#endif
+
+        // Rule-based generation (original path)
         switch (req.instrument)
         {
             case InstrumentType::Kick:    result.params = generateKick (req, rng);    break;
@@ -46,7 +133,347 @@ public:
         return result;
     }
 
+#if USE_ONNX_INFERENCE
+    // ================================================================
+    // ONNX PARAMETER PREDICTION
+    // ================================================================
+    // Input tensor: [instrument_onehot(10) + genre_onehot(9) + sliders(5)] = 24 floats
+    // Sliders: [brillo, cuerpo, textura, movimiento, impacto]
+    // Output: raw parameter vector from the model
+
+    struct ONNXPrediction
+    {
+        std::vector<float> params;
+        bool success = false;
+    };
+
+    ONNXPrediction predictFromONNX (int instrumentIdx, int genreIdx, float sliders[5])
+    {
+        ONNXPrediction pred;
+        if (!onnxAvailable || !paramSession) return pred;
+
+        try
+        {
+            // Build input tensor: 24 floats
+            std::array<float, 24> inputData {};
+            inputData.fill (0.0f);
+
+            // Instrument one-hot (10 classes)
+            if (instrumentIdx >= 0 && instrumentIdx < 10)
+                inputData[instrumentIdx] = 1.0f;
+
+            // Genre one-hot (9 classes)
+            if (genreIdx >= 0 && genreIdx < 9)
+                inputData[10 + genreIdx] = 1.0f;
+
+            // Sliders (5 floats)
+            for (int i = 0; i < 5; ++i)
+                inputData[19 + i] = sliders[i];
+
+            // Create input tensor
+            std::array<int64_t, 2> inputShape = { 1, 24 };
+            Ort::MemoryInfo memInfo = Ort::MemoryInfo::CreateCpu (OrtArenaAllocator, OrtMemTypeDefault);
+            Ort::Value inputTensor = Ort::Value::CreateTensor<float> (
+                memInfo, inputData.data(), inputData.size(),
+                inputShape.data(), inputShape.size());
+
+            // Run inference (I/O names must match 06_export_onnx.py)
+            const char* inputNames[] = { "controls" };
+            const char* outputNames[] = { "params" };
+
+            auto outputTensors = paramSession->Run (
+                Ort::RunOptions { nullptr },
+                inputNames, &inputTensor, 1,
+                outputNames, 1);
+
+            // Extract output
+            float* outputData = outputTensors[0].GetTensorMutableData<float>();
+            auto outputInfo = outputTensors[0].GetTensorTypeAndShapeInfo();
+            size_t outputSize = outputInfo.GetElementCount();
+
+            pred.params.assign (outputData, outputData + outputSize);
+            pred.success = true;
+        }
+        catch (const Ort::Exception&)
+        {
+            pred.success = false;
+        }
+
+        return pred;
+    }
+
+    // ================================================================
+    // ONNX QUALITY SCORING
+    // ================================================================
+    // Scores generated audio quality on [0, 1] using the quality_scorer model.
+    // Input: 33 audio features extracted from the rendered buffer:
+    //   20 scalar features (attack_time, decay_time, duration, peak, crest,
+    //   transient_sharpness, spectral_centroid, spectral_rolloff, spectral_bandwidth,
+    //   spectral_flatness, spectral_tilt, fundamental_freq, harmonic_ratio,
+    //   pitch_drop_semitones, pitch_drop_time, brightness_index, warmth_index,
+    //   noise_ratio, stereo_width, zero_crossing_rate)
+    //   + 13 MFCCs = 33 total
+    // Returns quality score [0, 1], or -1.0f on failure.
+
+    static constexpr int kQualityScorerInputDim = 33;
+
+    float scoreQuality (const float* audioFeatures, int numFeatures)
+    {
+        if (!onnxAvailable || !qualitySession) return -1.0f;
+        if (audioFeatures == nullptr || numFeatures != kQualityScorerInputDim) return -1.0f;
+
+        try
+        {
+            std::array<float, kQualityScorerInputDim> inputData {};
+            for (int i = 0; i < kQualityScorerInputDim; ++i)
+                inputData[i] = audioFeatures[i];
+
+            std::array<int64_t, 2> inputShape = { 1, kQualityScorerInputDim };
+            Ort::MemoryInfo memInfo = Ort::MemoryInfo::CreateCpu (OrtArenaAllocator, OrtMemTypeDefault);
+            Ort::Value inputTensor = Ort::Value::CreateTensor<float> (
+                memInfo, inputData.data(), inputData.size(),
+                inputShape.data(), inputShape.size());
+
+            // I/O names must match 07_train_quality_scorer.py export
+            const char* inputNames[] = { "features" };
+            const char* outputNames[] = { "quality_score" };
+
+            auto outputTensors = qualitySession->Run (
+                Ort::RunOptions { nullptr },
+                inputNames, &inputTensor, 1,
+                outputNames, 1);
+
+            float* outputData = outputTensors[0].GetTensorMutableData<float>();
+            return outputData[0];
+        }
+        catch (const Ort::Exception&)
+        {
+            return -1.0f;
+        }
+    }
+#endif
+
 private:
+
+#if USE_ONNX_INFERENCE
+    Ort::Env env { ORT_LOGGING_LEVEL_WARNING, "OneShotAI" };
+    std::unique_ptr<Ort::Session> paramSession;
+    std::unique_ptr<Ort::Session> qualitySession;
+    bool onnxAvailable = false;
+    std::string onnxLoadError;
+
+    // Convert enum to index for one-hot encoding
+    static int instrumentToIndex (InstrumentType t)
+    {
+        switch (t)
+        {
+            case InstrumentType::Kick:    return 0;
+            case InstrumentType::Snare:   return 1;
+            case InstrumentType::HiHat:   return 2;
+            case InstrumentType::Clap:    return 3;
+            case InstrumentType::Perc:    return 4;
+            case InstrumentType::Bass808: return 5;
+            case InstrumentType::Lead:    return 6;
+            case InstrumentType::Pluck:   return 7;
+            case InstrumentType::Pad:     return 8;
+            case InstrumentType::Texture: return 9;
+        }
+        return 0;
+    }
+
+    static int genreToIndex (GenreStyle g)
+    {
+        switch (g)
+        {
+            case GenreStyle::Trap:      return 0;
+            case GenreStyle::HipHop:    return 1;
+            case GenreStyle::Techno:    return 2;
+            case GenreStyle::House:     return 3;
+            case GenreStyle::Reggaeton: return 4;
+            case GenreStyle::Afrobeat:  return 5;
+            case GenreStyle::RnB:       return 6;
+            case GenreStyle::EDM:       return 7;
+            case GenreStyle::Ambient:   return 8;
+        }
+        return 0;
+    }
+
+    // Helper: denormalize a 0..1 value to [lo, hi]
+    static float denorm (float normalized, float lo, float hi)
+    {
+        return lo + std::max (0.0f, std::min (1.0f, normalized)) * (hi - lo);
+    }
+
+    // Generate params from ONNX model output.
+    // The model outputs 35 normalized floats (0..1 via Sigmoid).
+    // Each instrument uses the first N slots matching its PARAM_BOUNDS order.
+    // Jitter is applied after denormalization to add per-render variation.
+    InstrumentParamsVariant generateFromONNX (const GenerationRequest& req, std::mt19937& rng)
+    {
+        int instIdx = instrumentToIndex (req.instrument);
+        int genreIdx = genreToIndex (req.genre);
+        float sliders[5] = {
+            req.character.brillo,
+            req.character.cuerpo,
+            req.character.textura,
+            req.character.movimiento,
+            req.impacto
+        };
+
+        auto pred = predictFromONNX (instIdx, genreIdx, sliders);
+        if (!pred.success || pred.params.size() < 5)
+            throw std::runtime_error ("ONNX prediction failed");
+
+        const auto& v = pred.params; // shorthand
+
+        switch (req.instrument)
+        {
+            case InstrumentType::Kick:
+            {
+                KickParams p = genrerules::kickBase (req.genre);
+                p.base.attack = attackTimeFor (req.attack, req.instrument);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                p.subFreq       = clamp (jitter (denorm (v[0], 30.0f, 70.0f), 8.0f, rng), 30.0f, 70.0f);
+                p.clickAmount   = clamp (jitter (denorm (v[1], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                p.bodyDecay     = clamp (jitter (denorm (v[2], 0.05f, 0.5f), 0.08f, rng), 0.05f, 0.6f);
+                p.pitchDrop     = clamp (jitter (denorm (v[3], 10.0f, 60.0f), 10.0f, rng), 8.0f, 72.0f);
+                p.pitchDropTime = clamp (jitter (denorm (v[4], 0.01f, 0.1f), 0.015f, rng), 0.005f, 0.1f);
+                p.driveAmount   = clamp (jitter (denorm (v[5], 0.0f, 0.5f), 0.12f, rng), 0.0f, 0.8f);
+                p.subLevel      = clamp (jitter (denorm (v[6], 0.3f, 1.0f), 0.12f, rng), 0.3f, 1.0f);
+                p.tailLength    = clamp (jitter (denorm (v[7], 0.05f, 0.6f), 0.12f, rng), 0.1f, 1.0f);
+                return p;
+            }
+            case InstrumentType::Snare:
+            {
+                SnareParams p = genrerules::snareBase (req.genre);
+                p.base.attack = attackTimeFor (req.attack, req.instrument);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                p.bodyFreq      = clamp (jitter (denorm (v[0], 120.0f, 280.0f), 30.0f, rng), 120.0f, 300.0f);
+                p.bodyMix       = clamp (jitter (denorm (v[1], 0.2f, 0.9f), 0.12f, rng), 0.10f, 0.55f);
+                p.bodyDecay     = clamp (jitter (denorm (v[2], 0.03f, 0.2f), 0.04f, rng), 0.03f, 0.25f);
+                p.noiseDecay    = clamp (jitter (denorm (v[3], 0.05f, 0.25f), 0.04f, rng), 0.04f, 0.25f);
+                p.snapAmount    = clamp (jitter (denorm (v[4], 0.0f, 0.8f), 0.15f, rng), 0.0f, 1.0f);
+                p.noiseColor    = clamp (jitter (denorm (v[5], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                p.wireAmount    = clamp (jitter (denorm (v[6], 0.0f, 1.0f), 0.12f, rng), 0.0f, 1.0f);
+                return p;
+            }
+            case InstrumentType::HiHat:
+            {
+                HiHatParams p = genrerules::hiHatBase (req.genre);
+                p.base.attack = attackTimeFor (req.attack, req.instrument);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                p.closedDecay   = clamp (jitter (denorm (v[0], 0.01f, 0.3f), 0.015f, rng), 0.005f, 0.08f);
+                p.openDecay     = clamp (jitter (denorm (v[0], 0.05f, 0.5f), 0.10f, rng), 0.05f, 0.8f);
+                p.highPassFreq  = clamp (jitter (denorm (v[1], 2000.0f, 12000.0f), 800.0f, rng), 1500.0f, 10000.0f);
+                p.freqRange     = clamp (jitter (denorm (v[2], 200.0f, 800.0f), 1200.0f, rng), 3000.0f, 14000.0f);
+                p.metallic      = clamp (jitter (denorm (v[3], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                p.noiseColor    = clamp (jitter (denorm (v[4], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                p.ringAmount    = clamp (jitter (denorm (v[5], 0.0f, 1.0f), 0.12f, rng), 0.0f, 0.7f);
+                return p;
+            }
+            case InstrumentType::Clap:
+            {
+                ClapParams p = genrerules::clapBase (req.genre);
+                p.base.attack = attackTimeFor (req.attack, req.instrument);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                p.noiseDecay    = clamp (jitter (denorm (v[0], 0.05f, 0.4f), 0.05f, rng), 0.03f, 0.20f);
+                p.layerSpacing  = clamp (jitter (denorm (v[1], 0.005f, 0.03f), 0.006f, rng), 0.004f, 0.025f);
+                p.numLayers     = clamp (jitter (denorm (v[2], 2.0f, 8.0f), 1.2f, rng), 2.0f, 8.0f);
+                p.noiseColor    = clamp (jitter (denorm (v[3], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                p.thickness     = clamp (jitter (denorm (v[4], 0.0f, 1.0f), 0.15f, rng), 0.1f, 1.0f);
+                p.transientSnap = clamp (jitter (denorm (v[5], 0.0f, 1.0f), 0.12f, rng), 0.2f, 1.0f);
+                return p;
+            }
+            case InstrumentType::Perc:
+            {
+                PercParams p = genrerules::percBase (req.genre);
+                p.base.attack = attackTimeFor (req.attack, req.instrument);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                p.freq          = clamp (jitter (denorm (v[0], 100.0f, 2000.0f), 100.0f, rng), 150.0f, 2200.0f);
+                p.toneDecay     = clamp (jitter (denorm (v[1], 0.02f, 0.3f), 0.04f, rng), 0.02f, 0.25f);
+                p.clickAmount   = clamp (jitter (denorm (v[2], 0.0f, 0.8f), 0.15f, rng), 0.0f, 1.0f);
+                p.pitchDrop     = clamp (jitter (denorm (v[3], 0.0f, 24.0f), 6.0f, rng), 0.0f, 36.0f);
+                p.woodiness     = clamp (jitter (denorm (v[4], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                p.metallic      = clamp (jitter (denorm (v[5], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                return p;
+            }
+            case InstrumentType::Bass808:
+            {
+                Bass808Params p = genrerules::bass808Base (req.genre);
+                p.base.attack = attackTimeFor (req.attack, req.instrument);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                p.subFreq       = clamp (jitter (denorm (v[0], 25.0f, 65.0f), 6.0f, rng), 28.0f, 65.0f);
+                p.sustainLevel  = clamp (jitter (denorm (v[1], 0.1f, 1.5f), 0.15f, rng), 0.15f, 0.90f);
+                p.saturation    = clamp (jitter (denorm (v[2], 0.0f, 0.8f), 0.12f, rng), 0.0f, 0.8f);
+                p.glideAmount   = clamp (jitter (denorm (v[3], 0.0f, 12.0f), 2.0f, rng), 0.0f, 10.0f);
+                p.reeseMix      = clamp (jitter (denorm (v[4], 0.0f, 1.0f), 0.12f, rng), 0.0f, 1.0f);
+                p.filterEnvAmt  = clamp (jitter (denorm (v[5], 0.0f, 1.0f), 0.10f, rng), 0.0f, 1.0f);
+                p.punchiness    = clamp (jitter (denorm (v[6], 0.0f, 1.0f), 0.12f, rng), 0.0f, 1.0f);
+                return p;
+            }
+            case InstrumentType::Lead:
+            {
+                LeadParams p = genrerules::leadBase (req.genre);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                float freq      = jitter (denorm (v[0], 200.0f, 1000.0f), 60.0f, rng);
+                p.base.pitchBase = 69.0f + 12.0f * std::log2 (std::max (freq, 20.0f) / 440.0f);
+                p.base.attack   = denorm (v[3], 0.001f, 0.1f);
+                p.base.decay    = denorm (v[4], 0.1f, 1.0f);
+                p.oscDetune     = clamp (jitter (denorm (v[1], 0.0f, 0.05f), 0.06f, rng), 0.0f, 0.5f);
+                p.pulseWidth    = clamp (jitter (denorm (v[2], 0.1f, 0.9f), 0.12f, rng), 0.1f, 0.9f);
+                p.brightness    = clamp (jitter (denorm (v[5], 0.0f, 1.0f), 0.12f, rng), 0.1f, 1.0f);
+                p.vibratoRate   = clamp (jitter (denorm (v[6], 0.5f, 8.0f), 1.0f, rng), 2.0f, 10.0f);
+                return p;
+            }
+            case InstrumentType::Pluck:
+            {
+                PluckParams p = genrerules::pluckBase (req.genre);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                float freq      = jitter (denorm (v[0], 150.0f, 800.0f), 50.0f, rng);
+                p.base.pitchBase = 69.0f + 12.0f * std::log2 (std::max (freq, 20.0f) / 440.0f);
+                p.decayTime     = clamp (jitter (denorm (v[1], 0.05f, 0.5f), 0.12f, rng), 0.1f, 1.5f);
+                p.brightness    = clamp (jitter (denorm (v[2], 0.1f, 0.9f), 0.12f, rng), 0.1f, 1.0f);
+                p.damping       = clamp (jitter (denorm (v[3], 0.0f, 1.0f), 0.12f, rng), 0.1f, 0.9f);
+                p.bodyResonance = clamp (jitter (denorm (v[4], 0.0f, 1.0f), 0.12f, rng), 0.0f, 0.7f);
+                p.fmAmount      = clamp (jitter (denorm (v[5], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                return p;
+            }
+            case InstrumentType::Pad:
+            {
+                PadParams p = genrerules::padBase (req.genre);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                float freq      = jitter (denorm (v[0], 80.0f, 500.0f), 40.0f, rng);
+                p.base.pitchBase = 69.0f + 12.0f * std::log2 (std::max (freq, 20.0f) / 440.0f);
+                p.base.attack   = denorm (v[1], 0.05f, 1.0f);
+                p.base.release  = denorm (v[2], 0.1f, 2.0f);
+                p.detuneSpread  = clamp (jitter (denorm (v[3], 0.0f, 0.03f), 0.06f, rng), 0.02f, 0.5f);
+                p.warmth        = clamp (jitter (denorm (v[4], 0.0f, 1.0f), 0.15f, rng), 0.1f, 0.9f);
+                p.chorusAmount  = clamp (jitter (denorm (v[5], 0.0f, 1.0f), 0.12f, rng), 0.0f, 0.6f);
+                p.filterSweep   = clamp (jitter (denorm (v[6], 0.0f, 1.0f), 0.10f, rng), 0.0f, 0.5f);
+                p.evolutionRate = clamp (jitter (denorm (v[7], 0.0f, 1.0f), 0.08f, rng), 0.01f, 0.4f);
+                return p;
+            }
+            case InstrumentType::Texture:
+            {
+                TextureParams p = genrerules::textureBase (req.genre);
+                applyCharacterToBase (p.base, req.character, req.impacto, req.energy);
+                p.density       = clamp (jitter (denorm (v[0], 0.1f, 0.9f), 0.15f, rng), 0.1f, 1.0f);
+                p.base.filterCutoff = clamp (jitter (denorm (v[1], 1000.0f, 18000.0f), 2000.0f, rng), 500.0f, 20000.0f);
+                p.movement      = clamp (jitter (denorm (v[2], 0.0f, 0.8f), 0.15f, rng), 0.0f, 1.0f);
+                p.grainSize     = clamp (jitter (denorm (v[3], 0.005f, 0.1f), 0.02f, rng), 0.01f, 0.15f);
+                p.noiseColor    = clamp (jitter (denorm (v[4], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                p.spectralTilt  = clamp (jitter (denorm (v[5], -1.0f, 1.0f), 0.15f, rng), -0.8f, 0.8f);
+                p.pitchedness   = clamp (jitter (denorm (v[6], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                p.pitch         = clamp (jitter (denorm (v[7], 0.0f, 1.0f), 0.15f, rng), 0.0f, 1.0f);
+                return p;
+            }
+        }
+
+        // Fallback (should not reach here)
+        return generateKick (req, rng);
+    }
+#endif
+
     // ================================================================
     // HELPERS
     // ================================================================
@@ -169,15 +596,15 @@ private:
         float eMult = energyMult (req.energy);
         p.driveAmount *= eMult;
 
-        // Randomización controlada
-        p.subFreq       = clamp (jitter (p.subFreq, 4.0f, rng), 30.0f, 70.0f);
-        p.clickAmount   = clamp (jitter (p.clickAmount, 0.08f, rng), 0.0f, 1.0f);
-        p.bodyDecay     = clamp (jitter (p.bodyDecay, 0.03f, rng), 0.05f, 0.6f);
-        p.pitchDrop     = clamp (jitter (p.pitchDrop, 4.0f, rng), 8.0f, 72.0f);
-        p.pitchDropTime = clamp (jitter (p.pitchDropTime, 0.005f, rng), 0.005f, 0.1f);
-        p.driveAmount   = clamp (jitter (p.driveAmount, 0.05f, rng), 0.0f, 0.8f);
-        p.subLevel      = clamp (jitter (p.subLevel, 0.05f, rng), 0.3f, 1.0f);
-        p.tailLength    = clamp (jitter (p.tailLength, 0.05f, rng), 0.1f, 1.0f);
+        // Randomización controlada (~20-25% del rango de cada param)
+        p.subFreq       = clamp (jitter (p.subFreq, 8.0f, rng), 30.0f, 70.0f);
+        p.clickAmount   = clamp (jitter (p.clickAmount, 0.20f, rng), 0.0f, 1.0f);
+        p.bodyDecay     = clamp (jitter (p.bodyDecay, 0.10f, rng), 0.05f, 0.6f);
+        p.pitchDrop     = clamp (jitter (p.pitchDrop, 12.0f, rng), 8.0f, 72.0f);
+        p.pitchDropTime = clamp (jitter (p.pitchDropTime, 0.015f, rng), 0.005f, 0.1f);
+        p.driveAmount   = clamp (jitter (p.driveAmount, 0.15f, rng), 0.0f, 0.8f);
+        p.subLevel      = clamp (jitter (p.subLevel, 0.12f, rng), 0.3f, 1.0f);
+        p.tailLength    = clamp (jitter (p.tailLength, 0.15f, rng), 0.1f, 1.0f);
 
         return p;
     }
@@ -214,17 +641,17 @@ private:
         float eMult = energyMult (req.energy);
         p.noiseDecay *= eMult;
 
-        p.bodyFreq       = clamp (jitter (p.bodyFreq, 15.0f, rng), 120.0f, 300.0f);
-        p.bodyDecay      = clamp (jitter (p.bodyDecay, 0.02f, rng), 0.03f, 0.25f);
-        p.noiseDecay     = clamp (jitter (p.noiseDecay, 0.02f, rng), 0.04f, 0.25f);
-        p.noiseColor     = clamp (jitter (p.noiseColor, 0.08f, rng), 0.0f, 1.0f);
-        p.snapAmount     = clamp (jitter (p.snapAmount, 0.08f, rng), 0.0f, 1.0f);
-        p.ringFreq       = clamp (jitter (p.ringFreq, 30.0f, rng), 200.0f, 500.0f);
-        p.ringAmount     = clamp (jitter (p.ringAmount, 0.06f, rng), 0.0f, 0.6f);
-        p.wireAmount     = clamp (jitter (p.wireAmount, 0.06f, rng), 0.0f, 0.7f);
-        p.noiseTightness = clamp (jitter (p.noiseTightness, 0.06f, rng), 0.2f, 0.85f);
-        p.bodyMix        = clamp (jitter (p.bodyMix, 0.05f, rng), 0.10f, 0.55f);
-        p.noiseLP        = clamp (jitter (p.noiseLP, 500.0f, rng), 3000.0f, 12000.0f);
+        p.bodyFreq       = clamp (jitter (p.bodyFreq, 35.0f, rng), 120.0f, 300.0f);
+        p.bodyDecay      = clamp (jitter (p.bodyDecay, 0.05f, rng), 0.03f, 0.25f);
+        p.noiseDecay     = clamp (jitter (p.noiseDecay, 0.05f, rng), 0.04f, 0.25f);
+        p.noiseColor     = clamp (jitter (p.noiseColor, 0.20f, rng), 0.0f, 1.0f);
+        p.snapAmount     = clamp (jitter (p.snapAmount, 0.20f, rng), 0.0f, 1.0f);
+        p.ringFreq       = clamp (jitter (p.ringFreq, 60.0f, rng), 200.0f, 500.0f);
+        p.ringAmount     = clamp (jitter (p.ringAmount, 0.15f, rng), 0.0f, 0.6f);
+        p.wireAmount     = clamp (jitter (p.wireAmount, 0.15f, rng), 0.0f, 0.7f);
+        p.noiseTightness = clamp (jitter (p.noiseTightness, 0.15f, rng), 0.2f, 0.85f);
+        p.bodyMix        = clamp (jitter (p.bodyMix, 0.10f, rng), 0.10f, 0.55f);
+        p.noiseLP        = clamp (jitter (p.noiseLP, 1500.0f, rng), 3000.0f, 12000.0f);
 
         return p;
     }
@@ -255,14 +682,14 @@ private:
         // Impacto: high pass más alto, más definición
         p.highPassFreq += req.impacto * 2000.0f;
 
-        p.freqRange   = clamp (jitter (p.freqRange, 500.0f, rng), 3000.0f, 14000.0f);
-        p.metallic    = clamp (jitter (p.metallic, 0.08f, rng), 0.0f, 1.0f);
-        p.noiseColor  = clamp (jitter (p.noiseColor, 0.08f, rng), 0.0f, 1.0f);
-        p.openDecay   = clamp (jitter (p.openDecay, 0.05f, rng), 0.05f, 0.8f);
-        p.closedDecay = clamp (jitter (p.closedDecay, 0.005f, rng), 0.005f, 0.08f);
-        p.openAmount  = clamp (jitter (p.openAmount, 0.08f, rng), 0.0f, 1.0f);
-        p.ringAmount  = clamp (jitter (p.ringAmount, 0.06f, rng), 0.0f, 0.7f);
-        p.highPassFreq = clamp (jitter (p.highPassFreq, 300.0f, rng), 1500.0f, 10000.0f);
+        p.freqRange   = clamp (jitter (p.freqRange, 1500.0f, rng), 3000.0f, 14000.0f);
+        p.metallic    = clamp (jitter (p.metallic, 0.20f, rng), 0.0f, 1.0f);
+        p.noiseColor  = clamp (jitter (p.noiseColor, 0.20f, rng), 0.0f, 1.0f);
+        p.openDecay   = clamp (jitter (p.openDecay, 0.12f, rng), 0.05f, 0.8f);
+        p.closedDecay = clamp (jitter (p.closedDecay, 0.012f, rng), 0.005f, 0.08f);
+        p.openAmount  = clamp (jitter (p.openAmount, 0.20f, rng), 0.0f, 1.0f);
+        p.ringAmount  = clamp (jitter (p.ringAmount, 0.15f, rng), 0.0f, 0.7f);
+        p.highPassFreq = clamp (jitter (p.highPassFreq, 800.0f, rng), 1500.0f, 10000.0f);
 
         return p;
     }
@@ -297,17 +724,17 @@ private:
         p.transientSnap  += req.impacto * 0.15f;
         p.noiseTightness += req.impacto * 0.10f;
 
-        p.numLayers      = clamp (jitter (p.numLayers, 0.5f, rng), 2.0f, 8.0f);
-        p.layerSpacing   = clamp (jitter (p.layerSpacing, 0.003f, rng), 0.004f, 0.025f);
-        p.noiseDecay     = clamp (jitter (p.noiseDecay, 0.02f, rng), 0.03f, 0.20f);
-        p.noiseColor     = clamp (jitter (p.noiseColor, 0.08f, rng), 0.0f, 1.0f);
-        p.toneAmount     = clamp (jitter (p.toneAmount, 0.05f, rng), 0.0f, 0.5f);
-        p.toneFreq       = clamp (jitter (p.toneFreq, 100.0f, rng), 600.0f, 1500.0f);
-        p.reverbAmount   = clamp (jitter (p.reverbAmount, 0.06f, rng), 0.0f, 0.6f);
-        p.thickness      = clamp (jitter (p.thickness, 0.08f, rng), 0.1f, 1.0f);
-        p.noiseTightness = clamp (jitter (p.noiseTightness, 0.06f, rng), 0.2f, 0.85f);
-        p.noiseLP        = clamp (jitter (p.noiseLP, 500.0f, rng), 3000.0f, 10000.0f);
-        p.transientSnap  = clamp (jitter (p.transientSnap, 0.06f, rng), 0.2f, 1.0f);
+        p.numLayers      = clamp (jitter (p.numLayers, 1.5f, rng), 2.0f, 8.0f);
+        p.layerSpacing   = clamp (jitter (p.layerSpacing, 0.006f, rng), 0.004f, 0.025f);
+        p.noiseDecay     = clamp (jitter (p.noiseDecay, 0.05f, rng), 0.03f, 0.20f);
+        p.noiseColor     = clamp (jitter (p.noiseColor, 0.20f, rng), 0.0f, 1.0f);
+        p.toneAmount     = clamp (jitter (p.toneAmount, 0.12f, rng), 0.0f, 0.5f);
+        p.toneFreq       = clamp (jitter (p.toneFreq, 200.0f, rng), 600.0f, 1500.0f);
+        p.reverbAmount   = clamp (jitter (p.reverbAmount, 0.15f, rng), 0.0f, 0.6f);
+        p.thickness      = clamp (jitter (p.thickness, 0.20f, rng), 0.1f, 1.0f);
+        p.noiseTightness = clamp (jitter (p.noiseTightness, 0.15f, rng), 0.2f, 0.85f);
+        p.noiseLP        = clamp (jitter (p.noiseLP, 1500.0f, rng), 3000.0f, 10000.0f);
+        p.transientSnap  = clamp (jitter (p.transientSnap, 0.15f, rng), 0.2f, 1.0f);
 
         return p;
     }
@@ -338,14 +765,14 @@ private:
         p.clickAmount += req.impacto * 0.20f;
         p.pitchDrop   += req.impacto * 6.0f;
 
-        p.freq          = clamp (jitter (p.freq, 40.0f, rng), 150.0f, 800.0f);
-        p.toneDecay     = clamp (jitter (p.toneDecay, 0.015f, rng), 0.02f, 0.25f);
-        p.metallic      = clamp (jitter (p.metallic, 0.08f, rng), 0.0f, 1.0f);
-        p.woodiness     = clamp (jitter (p.woodiness, 0.08f, rng), 0.0f, 1.0f);
-        p.membrane      = clamp (jitter (p.membrane, 0.08f, rng), 0.0f, 1.0f);
-        p.clickAmount   = clamp (jitter (p.clickAmount, 0.08f, rng), 0.0f, 1.0f);
-        p.pitchDrop     = clamp (jitter (p.pitchDrop, 3.0f, rng), 0.0f, 36.0f);
-        p.harmonicRatio = clamp (jitter (p.harmonicRatio, 0.15f, rng), 0.5f, 3.0f);
+        p.freq          = clamp (jitter (p.freq, 120.0f, rng), 150.0f, 2200.0f);
+        p.toneDecay     = clamp (jitter (p.toneDecay, 0.04f, rng), 0.02f, 0.25f);
+        p.metallic      = clamp (jitter (p.metallic, 0.20f, rng), 0.0f, 1.0f);
+        p.woodiness     = clamp (jitter (p.woodiness, 0.20f, rng), 0.0f, 1.0f);
+        p.membrane      = clamp (jitter (p.membrane, 0.20f, rng), 0.0f, 1.0f);
+        p.clickAmount   = clamp (jitter (p.clickAmount, 0.20f, rng), 0.0f, 1.0f);
+        p.pitchDrop     = clamp (jitter (p.pitchDrop, 8.0f, rng), 0.0f, 36.0f);
+        p.harmonicRatio = clamp (jitter (p.harmonicRatio, 0.35f, rng), 0.5f, 3.0f);
 
         return p;
     }
@@ -388,18 +815,18 @@ private:
         p.harmonics  *= eMult;
         p.punchiness *= eMult;
 
-        p.subFreq       = clamp (jitter (p.subFreq, 3.0f, rng), 28.0f, 65.0f);
-        p.sustainLevel  = clamp (jitter (p.sustainLevel, 0.06f, rng), 0.15f, 0.90f);
-        p.glideTime     = clamp (jitter (p.glideTime, 0.01f, rng), 0.0f, 0.15f);
-        p.glideAmount   = clamp (jitter (p.glideAmount, 1.0f, rng), 0.0f, 10.0f);
-        p.saturation    = clamp (jitter (p.saturation, 0.06f, rng), 0.0f, 0.8f);
-        p.subOctave     = clamp (jitter (p.subOctave, 0.04f, rng), 0.0f, 0.4f);
-        p.harmonics     = clamp (jitter (p.harmonics, 0.05f, rng), 0.0f, 0.6f);
-        p.tailLength    = clamp (jitter (p.tailLength, 0.10f, rng), 0.2f, 1.8f);
-        p.reeseMix      = clamp (jitter (p.reeseMix, 0.06f, rng), 0.0f, 1.0f);
-        p.reeseDetune   = clamp (jitter (p.reeseDetune, 0.05f, rng), 0.0f, 0.8f);
-        p.punchiness    = clamp (jitter (p.punchiness, 0.06f, rng), 0.0f, 1.0f);
-        p.filterEnvAmt  = clamp (jitter (p.filterEnvAmt, 0.05f, rng), 0.0f, 1.0f);
+        p.subFreq       = clamp (jitter (p.subFreq, 7.0f, rng), 28.0f, 65.0f);
+        p.sustainLevel  = clamp (jitter (p.sustainLevel, 0.15f, rng), 0.15f, 0.90f);
+        p.glideTime     = clamp (jitter (p.glideTime, 0.03f, rng), 0.0f, 0.15f);
+        p.glideAmount   = clamp (jitter (p.glideAmount, 2.5f, rng), 0.0f, 10.0f);
+        p.saturation    = clamp (jitter (p.saturation, 0.15f, rng), 0.0f, 0.8f);
+        p.subOctave     = clamp (jitter (p.subOctave, 0.10f, rng), 0.0f, 0.4f);
+        p.harmonics     = clamp (jitter (p.harmonics, 0.12f, rng), 0.0f, 0.6f);
+        p.tailLength    = clamp (jitter (p.tailLength, 0.25f, rng), 0.2f, 1.8f);
+        p.reeseMix      = clamp (jitter (p.reeseMix, 0.15f, rng), 0.0f, 1.0f);
+        p.reeseDetune   = clamp (jitter (p.reeseDetune, 0.12f, rng), 0.0f, 0.8f);
+        p.punchiness    = clamp (jitter (p.punchiness, 0.15f, rng), 0.0f, 1.0f);
+        p.filterEnvAmt  = clamp (jitter (p.filterEnvAmt, 0.12f, rng), 0.0f, 1.0f);
 
         return p;
     }
@@ -441,16 +868,16 @@ private:
         p.unisonVoices *= eMult;
         p.filterEnvAmt *= eMult;
 
-        p.oscDetune    = clamp (jitter (p.oscDetune, 0.03f, rng), 0.0f, 0.5f);
-        p.pulseWidth   = clamp (jitter (p.pulseWidth, 0.06f, rng), 0.1f, 0.9f);
-        p.vibratoRate  = clamp (jitter (p.vibratoRate, 0.5f, rng), 2.0f, 10.0f);
-        p.vibratoDepth = clamp (jitter (p.vibratoDepth, 0.03f, rng), 0.0f, 0.5f);
-        p.brightness   = clamp (jitter (p.brightness, 0.06f, rng), 0.1f, 1.0f);
-        p.waveformMix  = clamp (jitter (p.waveformMix, 0.08f, rng), 0.0f, 1.0f);
-        p.unisonVoices = clamp (jitter (p.unisonVoices, 0.3f, rng), 1.0f, 8.0f);
-        p.portamento   = clamp (jitter (p.portamento, 0.01f, rng), 0.0f, 0.15f);
-        p.filterEnvAmt = clamp (jitter (p.filterEnvAmt, 0.06f, rng), 0.0f, 0.8f);
-        p.subOscLevel  = clamp (jitter (p.subOscLevel, 0.04f, rng), 0.0f, 0.5f);
+        p.oscDetune    = clamp (jitter (p.oscDetune, 0.08f, rng), 0.0f, 0.5f);
+        p.pulseWidth   = clamp (jitter (p.pulseWidth, 0.15f, rng), 0.1f, 0.9f);
+        p.vibratoRate  = clamp (jitter (p.vibratoRate, 1.5f, rng), 2.0f, 10.0f);
+        p.vibratoDepth = clamp (jitter (p.vibratoDepth, 0.08f, rng), 0.0f, 0.5f);
+        p.brightness   = clamp (jitter (p.brightness, 0.15f, rng), 0.1f, 1.0f);
+        p.waveformMix  = clamp (jitter (p.waveformMix, 0.20f, rng), 0.0f, 1.0f);
+        p.unisonVoices = clamp (jitter (p.unisonVoices, 1.0f, rng), 1.0f, 8.0f);
+        p.portamento   = clamp (jitter (p.portamento, 0.03f, rng), 0.0f, 0.15f);
+        p.filterEnvAmt = clamp (jitter (p.filterEnvAmt, 0.15f, rng), 0.0f, 0.8f);
+        p.subOscLevel  = clamp (jitter (p.subOscLevel, 0.10f, rng), 0.0f, 0.5f);
 
         return p;
     }
@@ -483,14 +910,14 @@ private:
         p.stringTension += req.impacto * 0.15f;
         p.pickPosition  += req.impacto * 0.10f;
 
-        p.brightness    = clamp (jitter (p.brightness, 0.06f, rng), 0.1f, 1.0f);
-        p.bodyResonance = clamp (jitter (p.bodyResonance, 0.06f, rng), 0.0f, 0.7f);
-        p.decayTime     = clamp (jitter (p.decayTime, 0.06f, rng), 0.1f, 1.5f);
-        p.damping       = clamp (jitter (p.damping, 0.06f, rng), 0.1f, 0.9f);
-        p.pickPosition  = clamp (jitter (p.pickPosition, 0.06f, rng), 0.1f, 0.9f);
-        p.stringTension = clamp (jitter (p.stringTension, 0.06f, rng), 0.2f, 0.9f);
-        p.harmonics     = clamp (jitter (p.harmonics, 0.05f, rng), 0.0f, 0.7f);
-        p.stereoWidth   = clamp (jitter (p.stereoWidth, 0.06f, rng), 0.0f, 0.8f);
+        p.brightness    = clamp (jitter (p.brightness, 0.15f, rng), 0.1f, 1.0f);
+        p.bodyResonance = clamp (jitter (p.bodyResonance, 0.15f, rng), 0.0f, 0.7f);
+        p.decayTime     = clamp (jitter (p.decayTime, 0.15f, rng), 0.1f, 1.5f);
+        p.damping       = clamp (jitter (p.damping, 0.15f, rng), 0.1f, 0.9f);
+        p.pickPosition  = clamp (jitter (p.pickPosition, 0.15f, rng), 0.1f, 0.9f);
+        p.stringTension = clamp (jitter (p.stringTension, 0.15f, rng), 0.2f, 0.9f);
+        p.harmonics     = clamp (jitter (p.harmonics, 0.12f, rng), 0.0f, 0.7f);
+        p.stereoWidth   = clamp (jitter (p.stereoWidth, 0.15f, rng), 0.0f, 0.8f);
 
         return p;
     }
@@ -533,16 +960,16 @@ private:
         p.stereoWidth  *= (0.8f + eMult * 0.2f);
         p.subLevel     *= eMult;
 
-        p.unisonVoices = clamp (jitter (p.unisonVoices, 0.5f, rng), 2.0f, 16.0f);
-        p.detuneSpread = clamp (jitter (p.detuneSpread, 0.03f, rng), 0.02f, 0.5f);
-        p.driftRate    = clamp (jitter (p.driftRate, 0.05f, rng), 0.05f, 0.6f);
-        p.warmth       = clamp (jitter (p.warmth, 0.08f, rng), 0.1f, 0.9f);
-        p.evolutionRate = clamp (jitter (p.evolutionRate, 0.03f, rng), 0.01f, 0.4f);
-        p.filterSweep  = clamp (jitter (p.filterSweep, 0.04f, rng), 0.0f, 0.5f);
-        p.stereoWidth  = clamp (jitter (p.stereoWidth, 0.06f, rng), 0.2f, 1.0f);
-        p.chorusAmount = clamp (jitter (p.chorusAmount, 0.06f, rng), 0.0f, 0.6f);
-        p.airAmount    = clamp (jitter (p.airAmount, 0.04f, rng), 0.0f, 0.5f);
-        p.subLevel     = clamp (jitter (p.subLevel, 0.05f, rng), 0.0f, 0.7f);
+        p.unisonVoices = clamp (jitter (p.unisonVoices, 1.5f, rng), 2.0f, 16.0f);
+        p.detuneSpread = clamp (jitter (p.detuneSpread, 0.08f, rng), 0.02f, 0.5f);
+        p.driftRate    = clamp (jitter (p.driftRate, 0.12f, rng), 0.05f, 0.6f);
+        p.warmth       = clamp (jitter (p.warmth, 0.18f, rng), 0.1f, 0.9f);
+        p.evolutionRate = clamp (jitter (p.evolutionRate, 0.08f, rng), 0.01f, 0.4f);
+        p.filterSweep  = clamp (jitter (p.filterSweep, 0.10f, rng), 0.0f, 0.5f);
+        p.stereoWidth  = clamp (jitter (p.stereoWidth, 0.15f, rng), 0.2f, 1.0f);
+        p.chorusAmount = clamp (jitter (p.chorusAmount, 0.15f, rng), 0.0f, 0.6f);
+        p.airAmount    = clamp (jitter (p.airAmount, 0.10f, rng), 0.0f, 0.5f);
+        p.subLevel     = clamp (jitter (p.subLevel, 0.12f, rng), 0.0f, 0.7f);
 
         return p;
     }
@@ -580,14 +1007,14 @@ private:
         p.density *= eMult;
         p.stereoWidth *= (0.8f + eMult * 0.2f);
 
-        p.density       = clamp (jitter (p.density, 0.08f, rng), 0.1f, 1.0f);
-        p.grainSize     = clamp (jitter (p.grainSize, 0.01f, rng), 0.01f, 0.15f);
-        p.scatter       = clamp (jitter (p.scatter, 0.06f, rng), 0.0f, 0.7f);
-        p.spectralTilt  = clamp (jitter (p.spectralTilt, 0.08f, rng), -0.8f, 0.8f);
-        p.movement      = clamp (jitter (p.movement, 0.08f, rng), 0.0f, 1.0f);
-        p.noiseColor    = clamp (jitter (p.noiseColor, 0.08f, rng), 0.0f, 1.0f);
-        p.stereoWidth   = clamp (jitter (p.stereoWidth, 0.06f, rng), 0.2f, 1.0f);
-        p.evolutionRate = clamp (jitter (p.evolutionRate, 0.04f, rng), 0.02f, 0.5f);
+        p.density       = clamp (jitter (p.density, 0.20f, rng), 0.1f, 1.0f);
+        p.grainSize     = clamp (jitter (p.grainSize, 0.025f, rng), 0.01f, 0.15f);
+        p.scatter       = clamp (jitter (p.scatter, 0.15f, rng), 0.0f, 0.7f);
+        p.spectralTilt  = clamp (jitter (p.spectralTilt, 0.20f, rng), -0.8f, 0.8f);
+        p.movement      = clamp (jitter (p.movement, 0.20f, rng), 0.0f, 1.0f);
+        p.noiseColor    = clamp (jitter (p.noiseColor, 0.20f, rng), 0.0f, 1.0f);
+        p.stereoWidth   = clamp (jitter (p.stereoWidth, 0.15f, rng), 0.2f, 1.0f);
+        p.evolutionRate = clamp (jitter (p.evolutionRate, 0.10f, rng), 0.02f, 0.5f);
 
         return p;
     }
