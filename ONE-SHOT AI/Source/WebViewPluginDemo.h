@@ -46,6 +46,7 @@
 #include "AI/ParameterGenerator.h"
 #include "SynthEngine/SynthEngine.h"
 #include "WebUI/OneShotWebUI.h"
+#include "OneShotMatch/OneShotMatchEngine.h"
 
 //==============================================================================
 // Helpers
@@ -250,6 +251,9 @@ public:
     SynthEngine synthEngine;
     juce::AudioBuffer<float> lastGeneratedBuffer;
     juce::String lastFileName;
+
+    // One-Shot Match system (independent from generator)
+    oneshotmatch::OneShotMatchEngine matchEngine;
 
     static constexpr double generationSampleRate = 44100.0;
 
@@ -506,6 +510,202 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
 
         juce::MemoryInputStream stream (jsonResponse.getCharPointer(),
                                          jsonResponse.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
+    // ── API: One-Shot Match — Load reference audio ──
+    if (urlToRetrieve.startsWith ("api/match/load"))
+    {
+        auto params = parseQueryParams (urlToRetrieve);
+        auto b64Data = params.getValue ("data", "");
+        auto filePath = params.getValue ("path", "");
+
+        juce::String jsonResponse;
+
+        if (b64Data.isNotEmpty())
+        {
+            // Decode base64 audio data from WebView2
+            juce::MemoryBlock decoded;
+            juce::MemoryOutputStream decodedStream (decoded, false);
+            if (juce::Base64::convertFromBase64 (decodedStream, b64Data))
+            {
+                // Parse WAV/audio from decoded bytes
+                juce::AudioFormatManager formatManager;
+                formatManager.registerBasicFormats();
+
+                auto memStream = std::make_unique<juce::MemoryInputStream> (
+                    decoded.getData(), decoded.getSize(), false);
+
+                std::unique_ptr<juce::AudioFormatReader> reader (
+                    formatManager.createReaderFor (std::move (memStream)));
+
+                if (reader != nullptr)
+                {
+                    juce::AudioBuffer<float> buffer ((int) reader->numChannels,
+                                                      (int) reader->lengthInSamples);
+                    reader->read (&buffer, 0, (int) reader->lengthInSamples, 0, true, true);
+
+                    if (processorRef.matchEngine.loadReference (buffer, reader->sampleRate))
+                        jsonResponse = "{\"ok\":true}";
+                    else
+                        jsonResponse = "{\"ok\":false,\"error\":\"" + processorRef.matchEngine.getError() + "\"}";
+                }
+                else
+                {
+                    jsonResponse = "{\"ok\":false,\"error\":\"Could not decode audio format\"}";
+                }
+            }
+            else
+            {
+                jsonResponse = "{\"ok\":false,\"error\":\"Base64 decode failed\"}";
+            }
+        }
+        else if (filePath.isNotEmpty())
+        {
+            juce::File file (filePath);
+            if (processorRef.matchEngine.loadReference (file))
+                jsonResponse = "{\"ok\":true}";
+            else
+                jsonResponse = "{\"ok\":false,\"error\":\"" + processorRef.matchEngine.getError() + "\"}";
+        }
+        else
+        {
+            jsonResponse = "{\"ok\":false,\"error\":\"No audio data provided\"}";
+        }
+
+        juce::MemoryInputStream stream (jsonResponse.getCharPointer(),
+                                         jsonResponse.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
+    // ── API: One-Shot Match — Analyze reference ──
+    if (urlToRetrieve.startsWith ("api/match/analyze"))
+    {
+        processorRef.matchEngine.analyzeReference();
+        auto json = processorRef.matchEngine.descriptorsToJSON (
+            processorRef.matchEngine.getRefDescriptors());
+
+        juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
+    // ── API: One-Shot Match — Start matching ──
+    if (urlToRetrieve.startsWith ("api/match/start"))
+    {
+        processorRef.matchEngine.startMatch();
+        juce::String json = "{\"ok\":true}";
+        juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
+    // ── API: One-Shot Match — Poll status ──
+    if (urlToRetrieve.startsWith ("api/match/status"))
+    {
+        auto state = processorRef.matchEngine.getState();
+        const char* stateStr = "idle";
+        switch (state)
+        {
+            case oneshotmatch::MatchState::Idle:      stateStr = "idle"; break;
+            case oneshotmatch::MatchState::Analyzing:  stateStr = "analyzing"; break;
+            case oneshotmatch::MatchState::Matching:   stateStr = "matching"; break;
+            case oneshotmatch::MatchState::Done:       stateStr = "done"; break;
+            case oneshotmatch::MatchState::Error:      stateStr = "error"; break;
+        }
+
+        auto& engine = processorRef.matchEngine;
+
+        juce::String json = "{";
+        json += "\"state\":\"" + juce::String (stateStr) + "\",";
+        json += "\"iteration\":" + juce::String (engine.getIteration()) + ",";
+        json += "\"maxIterations\":" + juce::String (engine.getMaxIterations()) + ",";
+        json += "\"distance\":" + juce::String (engine.getDistance(), 4);
+
+        if (state == oneshotmatch::MatchState::Done)
+        {
+            json += ",\"params\":" + engine.paramsToJSON (engine.getBestParams());
+            json += ",\"sensitivity\":" + engine.sensitivityToJSON();
+            json += ",\"refDescriptors\":" + engine.descriptorsToJSON (engine.getRefDescriptors());
+            json += ",\"matchedDescriptors\":" + engine.descriptorsToJSON (engine.getMatchedDescriptors());
+            json += ",\"converged\":" + juce::String (engine.getOptResult().converged ? "true" : "false");
+            json += ",\"gapAnalysis\":" + engine.gapAnalysisToJSON();
+        }
+
+        if (state == oneshotmatch::MatchState::Error)
+            json += ",\"error\":\"" + engine.getError() + "\"";
+
+        json += "}";
+
+        juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
+    // ── API: One-Shot Match — Cancel ──
+    if (urlToRetrieve.startsWith ("api/match/cancel"))
+    {
+        processorRef.matchEngine.cancelMatch();
+        juce::String json = "{\"ok\":true}";
+        juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
+    // ── API: One-Shot Match — Get matched audio as WAV ──
+    if (urlToRetrieve.startsWith ("api/match/audio"))
+    {
+        auto& buf = processorRef.matchEngine.getMatchedBuffer();
+        if (buf.getNumSamples() > 0)
+        {
+            auto wavData = encodeWav (buf, processorRef.matchEngine.getSampleRate());
+            if (! wavData.empty())
+                return juce::WebBrowserComponent::Resource { std::move (wavData),
+                                                              juce::String { "audio/wav" } };
+        }
+        return std::nullopt;
+    }
+
+    // ── API: One-Shot Match — Export audio to file ──
+    if (urlToRetrieve.startsWith ("api/match/export-audio"))
+    {
+        auto desktop = juce::File::getSpecialLocation (juce::File::userDesktopDirectory);
+        auto outputDir = desktop.getChildFile ("ONE-SHOT AI Output");
+        outputDir.createDirectory();
+
+        auto refName = processorRef.matchEngine.getReferenceFile().getFileNameWithoutExtension();
+        if (refName.isEmpty()) refName = "OneShotMatch";
+        auto file = outputDir.getChildFile (refName + "_matched.wav");
+
+        juce::String json;
+        if (processorRef.matchEngine.exportAudio (file))
+            json = "{\"ok\":true,\"path\":\"" + file.getFullPathName().replace ("\\", "\\\\") + "\"}";
+        else
+            json = "{\"ok\":false,\"error\":\"Export failed\"}";
+
+        juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
+    // ── API: One-Shot Match — Export preset JSON ──
+    if (urlToRetrieve.startsWith ("api/match/export-preset"))
+    {
+        auto desktop = juce::File::getSpecialLocation (juce::File::userDesktopDirectory);
+        auto outputDir = desktop.getChildFile ("ONE-SHOT AI Output");
+        outputDir.createDirectory();
+
+        auto refName = processorRef.matchEngine.getReferenceFile().getFileNameWithoutExtension();
+        if (refName.isEmpty()) refName = "OneShotMatch";
+        auto file = outputDir.getChildFile (refName + "_preset.json");
+
+        auto presetJson = processorRef.matchEngine.exportPresetJSON();
+        file.replaceWithText (presetJson);
+
+        juce::String json = "{\"ok\":true,\"path\":\"" + file.getFullPathName().replace ("\\", "\\\\") + "\"}";
+        juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
         return juce::WebBrowserComponent::Resource { streamToVector (stream),
                                                       juce::String { "application/json" } };
     }

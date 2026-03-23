@@ -1,10 +1,12 @@
 #pragma once
 
 #include <string>
+#include "OneShotMatchWebUI.h"
 
-// HTML/CSS/JS completo para la WebUI del ONE-SHOT AI Generator.
+// HTML/CSS/JS completo para la WebUI del ONE-SHOT AI.
 // Servido inline desde getResource() — no requiere archivos externos ni binary resources.
 // Dividido en partes para cumplir el limite de 16380 chars por string literal de MSVC.
+// Incluye dos modos: Generator (existente) y Kick Match (nuevo).
 
 namespace OneShotWebUI
 {
@@ -189,8 +191,26 @@ static const char* cssPart2()
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* === Tab navigation === */
+.tab-bar {
+    display: flex; gap: 0; margin-bottom: 16px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden;
+}
+.tab-btn {
+    flex: 1; padding: 12px 0; text-align: center;
+    font-size: 13px; font-weight: 700; letter-spacing: 1.5px;
+    text-transform: uppercase; cursor: pointer;
+    background: transparent; color: var(--text2);
+    border: none; transition: all 0.2s;
+}
+.tab-btn:hover { color: var(--text); background: var(--surface2); }
+.tab-btn.active { color: var(--accent); background: var(--surface2); }
+.tab-btn:not(:first-child) { border-left: 1px solid var(--border); }
+.gen-container { display: block; }
+.gen-container.hidden { display: none; }
 </style>
-</head>
 )css2";
 }
 
@@ -199,6 +219,15 @@ static const char* htmlBody()
     return R"body1(
 <body>
 <h1>ONE-SHOT AI</h1>
+
+<!-- Tab navigation -->
+<div class="tab-bar">
+    <button class="tab-btn active" data-tab="generator" id="tabGenerator">Generator</button>
+    <button class="tab-btn" data-tab="oneshotmatch" id="tabOneShotMatch">One-Shot Match</button>
+</div>
+
+<!-- Generator container (existing UI) -->
+<div class="gen-container" id="genContainer">
 <div class="section">
     <div class="row">
         <div class="select-group">
@@ -306,12 +335,35 @@ static const char* htmlBody()
     <button class="btn-download" id="downloadBtn">Download WAV</button>
 </div>
 <div class="status" id="status"></div>
+</div><!-- /gen-container -->
 )body1";
 }
 
 static const char* jsCode()
 {
     return R"js1(
+<script>
+// === Tab switching ===
+(function() {
+    var tabs = document.querySelectorAll('.tab-btn');
+    var genC = document.getElementById('genContainer');
+    var kmC = document.getElementById('kmContainer');
+    tabs.forEach(function(tab) {
+        tab.addEventListener('click', function() {
+            tabs.forEach(function(t){ t.classList.remove('active'); });
+            tab.classList.add('active');
+            var which = tab.getAttribute('data-tab');
+            if (which === 'generator') {
+                genC.classList.remove('hidden');
+                kmC.classList.remove('active');
+            } else {
+                genC.classList.add('hidden');
+                kmC.classList.add('active');
+            }
+        });
+    });
+})();
+</script>
 <script>
 (function() {
     'use strict';
@@ -447,14 +499,24 @@ static const char* jsCode()
     });
 })();
 </script>
-</body>
-</html>
 )js1";
+}
+
+static const char* htmlClosing()
+{
+    return "</body>\n</html>\n";
 }
 
 static const char* getHTML()
 {
-    static std::string html = std::string (cssPart1()) + cssPart2() + htmlBody() + jsCode();
+    static std::string html = std::string (cssPart1()) + cssPart2()
+                            + OneShotMatchWebUI::getCSS()
+                            + htmlBody()
+                            + OneShotMatchWebUI::getHTML()
+                            + jsCode()
+                            + OneShotMatchWebUI::getJS()
+                            + OneShotMatchWebUI::getJS2()
+                            + htmlClosing();
     return html.c_str();
 }
 
