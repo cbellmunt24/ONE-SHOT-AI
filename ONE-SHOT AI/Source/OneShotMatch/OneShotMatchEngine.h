@@ -224,6 +224,7 @@ public:
             optimizer.setTransientSample (&refTransient);
             optimizer.setSpectralEnvelope (&refSpectralEnvelope);
             optimizer.setHarmonicPhases (&refHarmonicPhases);
+            optimizer.setReferenceBuffer (&referenceBuffer);
 
             // Build learned profile from match history (adaptive weights + bounds + extensions)
             LearnedProfile learned = buildLearnedProfile (refDescriptors);
@@ -272,6 +273,19 @@ public:
             synth.setSpectralEnvelope (&refSpectralEnvelope);
             synth.setHarmonicPhases (&refHarmonicPhases);
             matchedBuffer = synth.generate (bestParams, referenceSampleRate);
+
+            // Sanitize buffer: replace NaN/inf with 0, hard clip to [-1,1]
+            for (int ch = 0; ch < matchedBuffer.getNumChannels(); ++ch)
+            {
+                auto* data = matchedBuffer.getWritePointer (ch);
+                for (int s = 0; s < matchedBuffer.getNumSamples(); ++s)
+                {
+                    if (std::isnan (data[s]) || std::isinf (data[s]))
+                        data[s] = 0.0f;
+                    else
+                        data[s] = std::max (-1.0f, std::min (1.0f, data[s]));
+                }
+            }
 
             // Extract descriptors for comparison display
             matchedDescriptors = extractor.extract (matchedBuffer, referenceSampleRate);
@@ -353,6 +367,7 @@ public:
     const OptimizationResult& getOptResult() const        { return bestResult; }
 
     const juce::AudioBuffer<float>& getReferenceBuffer() const { return referenceBuffer; }
+    const WavetableData& getRefWavetable() const { return refWavetable; }
     const juce::AudioBuffer<float>& getMatchedBuffer() const   { return matchedBuffer; }
     double getSampleRate() const                               { return referenceSampleRate; }
     const juce::File& getReferenceFile() const                 { return referenceFile; }
@@ -441,7 +456,19 @@ public:
         j += "\"bodyCentroid\":" + juce::String (d.bodyRegion.spectralCentroid, 1) + ",";
         j += "\"bodyFlatness\":" + juce::String (d.bodyRegion.spectralFlatness, 3) + ",";
         j += "\"tailCentroid\":" + juce::String (d.tailRegion.spectralCentroid, 1) + ",";
-        j += "\"tailRMS\":" + juce::String (d.tailRegion.rmsEnergy, 4);
+        j += "\"tailRMS\":" + juce::String (d.tailRegion.rmsEnergy, 4) + ",";
+
+        // New descriptors
+        j += "\"subHarmonicRatio\":" + juce::String (d.subHarmonicRatio, 3) + ",";
+        j += "\"noiseSpectralCentroid\":" + juce::String (d.noiseSpectralCentroid, 1) + ",";
+        j += "\"spectralCrest\":" + juce::String (d.spectralCrest, 2) + ",";
+        j += "\"harmonicProfile\":[";
+        for (int i = 0; i < MatchDescriptors::NUM_HARMONICS; ++i)
+        {
+            if (i > 0) j += ",";
+            j += juce::String (d.harmonicProfile[i], 3);
+        }
+        j += "]";
 
         j += "}";
         return j;
@@ -546,9 +573,9 @@ private:
     juce::String lastError;
 
     // Settings
-    int   maxIterations  = 250;
-    float targetDistance  = 0.4f;
-    int   populationSize = 60;
+    int   maxIterations  = 150;
+    float targetDistance  = 1.5f;
+    int   populationSize = 40;
 
     // Persistence
     juce::File matchDataDir;

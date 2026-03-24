@@ -201,10 +201,23 @@ struct MatchSynthParams
     float subWavetable     = 0.0f;    // 0..1 — crossfade sub sine→wavetable
     float transientSampleAmt = 0.0f;  // 0..1 (0=off) — reference transient sample mix
 
+    // === EXT v6 (11) ===
+    float pitchBounce      = 0.0f;    // 0..1 (0=off) — damped oscillation around fundamental
+    float pitchHoldTime    = 0.0f;    // 0..0.02 s — plateau before pitch decay
+    float clickType        = 0.0f;    // 0=noise, 1=impulse, 2=FM burst, 3=pitch chirp
+    float masterSatAmount  = 0.0f;    // 0..1 (0=off) — post-mix saturation
+    float masterSatType    = 0.0f;    // 0=soft-clip, 1=tape, 2=tube
+    float subPhaseOffset   = 0.0f;    // 0..6.283 — sub oscillator phase offset (radians)
+    float compAmount       = 0.0f;    // 0..1 (0=off) — internal compressor
+    float compRatio        = 4.0f;    // 1..20 — compression ratio
+    float compAttack       = 0.005f;  // 0.0001..0.05 s — compressor attack
+    float compRelease      = 0.05f;   // 0.01..0.5 s — compressor release
+    float subCrossover     = 0.0f;    // 0..300 Hz (0=auto: basePitch*4)
+
     // === Interface ===
     static constexpr int NUM_CORE_PARAMS = 22;
-    static constexpr int NUM_EXT_PARAMS  = 73;
-    static constexpr int NUM_PARAMS      = 95;
+    static constexpr int NUM_EXT_PARAMS  = 84;
+    static constexpr int NUM_PARAMS      = 106;
 
     void toArray (float* out) const
     {
@@ -238,6 +251,11 @@ struct MatchSynthParams
         out[86] = residualAmt; out[87] = residualLevel;
         out[88] = harmonic5; out[89] = harmonic6; out[90] = harmonic7; out[91] = harmonic8;
         out[92] = spectralMatchAmt; out[93] = subWavetable; out[94] = transientSampleAmt;
+        out[95] = pitchBounce; out[96] = pitchHoldTime;
+        out[97] = clickType; out[98] = masterSatAmount; out[99] = masterSatType;
+        out[100] = subPhaseOffset;
+        out[101] = compAmount; out[102] = compRatio; out[103] = compAttack; out[104] = compRelease;
+        out[105] = subCrossover;
     }
 
     void fromArray (const float* in)
@@ -292,6 +310,14 @@ struct MatchSynthParams
         harmonic7       = cl (in[90], 0.0f,  1.0f);       harmonic8        = cl (in[91], 0.0f,  1.0f);
         spectralMatchAmt= cl (in[92], 0.0f,  1.0f);       subWavetable     = cl (in[93], 0.0f,  1.0f);
         transientSampleAmt = cl (in[94], 0.0f, 1.0f);
+        pitchBounce     = cl (in[95], 0.0f,  1.0f);       pitchHoldTime    = cl (in[96], 0.0f,  0.02f);
+        clickType       = std::max (0.0f, std::min (3.0f, std::round (in[97])));
+        masterSatAmount = cl (in[98], 0.0f,  1.0f);
+        masterSatType   = std::max (0.0f, std::min (2.0f, std::round (in[99])));
+        subPhaseOffset  = cl (in[100], 0.0f, 6.283185f);
+        compAmount      = cl (in[101], 0.0f, 1.0f);       compRatio        = cl (in[102], 1.0f,  20.0f);
+        compAttack      = cl (in[103], 0.0001f, 0.05f);   compRelease      = cl (in[104], 0.01f, 0.5f);
+        subCrossover    = cl (in[105], 0.0f, 300.0f);
     }
 
     static void getBounds (float* mins, float* maxs)
@@ -299,7 +325,7 @@ struct MatchSynthParams
         mins[0]  = 0.0f;     maxs[0]  = 12.0f;      mins[1]  = 20.0f;    maxs[1]  = 200.0f;
         mins[2]  = 0.0f;     maxs[2]  = 1.0f;      mins[3]  = 0.0f;     maxs[3]  = 72.0f;
         mins[4]  = 0.0005f;  maxs[4]  = 0.05f;     mins[5]  = 0.005f;   maxs[5]  = 0.3f;
-        mins[6]  = 0.0f;     maxs[6]  = 1.0f;      mins[7]  = 0.0001f;  maxs[7]  = 0.01f;
+        mins[6]  = 0.0f;     maxs[6]  = 1.0f;      mins[7]  = 0.0001f;  maxs[7]  = 0.05f;
         mins[8]  = 0.01f;    maxs[8]  = 0.5f;      mins[9]  = 0.05f;    maxs[9]  = 1.5f;
         mins[10] = 0.0f;     maxs[10] = 1.0f;      mins[11] = 0.0f;     maxs[11] = 1.0f;
         mins[12] = 0.05f;    maxs[12] = 2.0f;      mins[13] = -5.0f;    maxs[13] = 5.0f;
@@ -344,6 +370,12 @@ struct MatchSynthParams
         mins[90] = 0.0f;     maxs[90] = 1.0f;      mins[91] = 0.0f;     maxs[91] = 1.0f;
         mins[92] = 0.0f;     maxs[92] = 1.0f;      mins[93] = 0.0f;     maxs[93] = 1.0f;
         mins[94] = 0.0f;     maxs[94] = 1.0f;
+        mins[95] = 0.0f;     maxs[95] = 1.0f;      mins[96] = 0.0f;     maxs[96] = 0.02f;
+        mins[97] = 0.0f;     maxs[97] = 3.0f;      mins[98] = 0.0f;     maxs[98] = 1.0f;
+        mins[99] = 0.0f;     maxs[99] = 2.0f;      mins[100] = 0.0f;    maxs[100] = 6.283185f;
+        mins[101] = 0.0f;    maxs[101] = 1.0f;     mins[102] = 1.0f;    maxs[102] = 20.0f;
+        mins[103] = 0.0001f; maxs[103] = 0.05f;    mins[104] = 0.01f;   maxs[104] = 0.5f;
+        mins[105] = 0.0f;    maxs[105] = 300.0f;
     }
 
     static const char* getParamName (int idx)
@@ -369,7 +401,9 @@ struct MatchSynthParams
             "subPitch","formantQ",
             "residualAmt","residualLevel",
             "harmonic5","harmonic6","harmonic7","harmonic8",
-            "spectralMatchAmt","subWavetable","transientSampleAmt"
+            "spectralMatchAmt","subWavetable","transientSampleAmt",
+            "pitchBounce","pitchHoldTime","clickType","masterSatAmount","masterSatType",
+            "subPhaseOffset","compAmount","compRatio","compAttack","compRelease","subCrossover"
         };
         return (idx >= 0 && idx < NUM_PARAMS) ? n[idx] : "?";
     }
@@ -382,7 +416,8 @@ struct MatchSynthParams
             "","","","","","","","Hz","","Hz","","","Hz","","","dB","dB","Hz","dB","","s","s","","","Hz",
             "","ct","","","Hz","Hz","","Hz","s","","s","",
             "","","","","","Hz","Hz","","Hz","",
-            "","","","","","","","",""
+            "","","","","","","","","",
+            "","s","","","","rad","","","s","s","Hz"
         };
         return (idx >= 0 && idx < NUM_PARAMS) ? u[idx] : "";
     }
@@ -418,6 +453,12 @@ struct MatchSynthParams
         if (idx == 92) return 92;               // spectral match
         if (idx == 93) return 93;               // sub wavetable
         if (idx == 94) return 94;               // transient sample
+        if (idx >= 95 && idx <= 96) return 95;  // pitch bounce group
+        if (idx == 97) return 97;               // click type
+        if (idx >= 98 && idx <= 99) return 98;  // master saturation group
+        if (idx == 100) return 100;             // sub phase offset
+        if (idx >= 101 && idx <= 104) return 101; // compressor group
+        if (idx == 105) return 105;             // sub crossover
         return -1;
     }
 
@@ -440,7 +481,7 @@ public:
         const float sr = (float) sampleRate;
         float duration = p.ampAttack + p.ampBodyDecay + p.subTailDecay + 0.12f;
         if (p.envSustainLevel > 0.01f) duration += p.envSustainTime + p.envRelease;
-        if (p.reverbAmt > 0.01f) duration += p.reverbDecay * 0.5f;
+        if (p.reverbAmt > 0.01f) duration += p.reverbDecay * 0.85f;
         int numSamples = synthutil::durationInSamples (duration, sampleRate);
 
         juce::AudioBuffer<float> buffer (2, numSamples);
@@ -449,7 +490,7 @@ public:
         dsputil::NoiseGenerator noise;
         noise.setSeed (42);
 
-        double bodyPhase = 0.0, subPhase = 0.0, fmModPhase = 0.0, wobbleLFOPhase = 0.0;
+        double bodyPhase = 0.0, subPhase = (double) p.subPhaseOffset / dsputil::TWO_PI, fmModPhase = 0.0, wobbleLFOPhase = 0.0;
         double harm2Phase = 0.0, harm3Phase = 0.0, harm4Phase = 0.0;
         double harm5Phase = 0.0, harm6Phase = 0.0, harm7Phase = 0.0, harm8Phase = 0.0;
         static constexpr int MAX_UNISON = 4;
@@ -460,7 +501,15 @@ public:
         clickBP.setParameters (p.clickFreq, 0.15f + (1.0f - p.clickWidth) * 0.55f, FilterType::BandPass, sr);
 
         dsputil::SVFilter subLP;
-        subLP.setParameters (std::min ((p.basePitch + p.subDetune) * 4.0f, sr * 0.48f), 0.0f, FilterType::LowPass, sr);
+        float subCrossFreq = (p.subCrossover > 1.0f) ? p.subCrossover : std::max (200.0f, (p.basePitch + p.subDetune) * 6.0f);
+        subLP.setParameters (std::min (subCrossFreq, sr * 0.48f), 0.0f, FilterType::LowPass, sr);
+
+        // Body highpass: crossover complement — removes sub from body so sub osc handles it
+        // This is THE key to controlling sub/lowMid energy balance independently
+        dsputil::SVFilter bodyHP;
+        bool useBodyHP = (p.subCrossover > 1.0f);
+        if (useBodyHP)
+            bodyHP.setParameters (std::min (subCrossFreq, sr * 0.48f), 0.0f, FilterType::HighPass, sr);
 
         dsputil::SVFilter mainFilter;
         mainFilter.setParameters (p.filterCutoff, 0.0f, FilterType::LowPass, sr);
@@ -526,16 +575,37 @@ public:
         dsputil::DCBlocker dcBlock;
         dsputil::Saturator saturator;
 
+        // Compressor state
+        float compEnvState = 0.0f;
+        float compAttCoeff = (p.compAmount > 0.01f) ? (1.0f - std::exp (-1.0f / (sr * std::max (0.0001f, p.compAttack)))) : 0.0f;
+        float compRelCoeff = (p.compAmount > 0.01f) ? (1.0f - std::exp (-1.0f / (sr * std::max (0.001f, p.compRelease)))) : 0.0f;
+        float compThreshDB = -12.0f; // fixed threshold, amount controls wet/dry
+
         // === Main loop ===
         for (int i = 0; i < numSamples; ++i)
         {
             float t = (float) i / sr;
 
-            // Pitch envelope
-            float fastEnv = std::exp (-t / std::max (0.0002f, p.pitchEnvFast));
-            float slowEnv = std::exp (-t / std::max (0.001f, p.pitchEnvSlow));
+            // Pitch envelope with optional hold and bounce
+            float tPitch = t;
+            if (p.pitchHoldTime > 0.0001f)
+                tPitch = std::max (0.0f, t - p.pitchHoldTime);
+
+            float fastEnv = std::exp (-tPitch / std::max (0.0002f, p.pitchEnvFast));
+            float slowEnv = std::exp (-tPitch / std::max (0.001f, p.pitchEnvSlow));
             float pitchEnv = fastEnv * p.pitchEnvBalance + slowEnv * (1.0f - p.pitchEnvBalance);
+            if (t < p.pitchHoldTime) pitchEnv = 1.0f;
+
             float bodyFreq = targetFreq + (startFreq - targetFreq) * pitchEnv;
+
+            // Pitch bounce: damped oscillation around fundamental
+            if (p.pitchBounce > 0.01f && tPitch > 0.0f)
+            {
+                float bounceFreq = 1.0f / std::max (0.002f, p.pitchEnvSlow * 2.0f);
+                float bounceDecay = std::exp (-tPitch / std::max (0.005f, p.pitchEnvSlow));
+                float bounce = std::sin (tPitch * bounceFreq * dsputil::TWO_PI) * bounceDecay;
+                bodyFreq += bounce * p.pitchBounce * targetFreq * 0.15f;
+            }
 
             if (p.pitchWobble > 0.01f)
             {
@@ -727,9 +797,41 @@ public:
                 }
             }
 
-            // Click
+            // Click (4 types: noise, impulse, FM burst, pitch chirp)
             float noiseRaw = noise.nextPink();
-            float click = clickBP.process (noiseRaw) * std::exp (-t / std::max (0.0001f, p.clickDecay)) * p.clickAmount;
+            float clickSig = 0.0f;
+            float clickEnvVal = std::exp (-t / std::max (0.0001f, p.clickDecay));
+            int cType = (int) p.clickType;
+            switch (cType)
+            {
+                case 0: // Filtered noise (original)
+                    clickSig = clickBP.process (noiseRaw) * clickEnvVal;
+                    break;
+                case 1: // Impulse / dirac-like
+                {
+                    float impT = t * sr;
+                    float imp = (impT < 3.0f) ? (1.0f - impT / 3.0f) : 0.0f;
+                    clickSig = clickBP.process (imp) * clickEnvVal;
+                    break;
+                }
+                case 2: // FM burst
+                {
+                    float fmClickFreq = p.clickFreq * (1.0f + 4.0f * clickEnvVal);
+                    float fmClickMod = std::sin (t * fmClickFreq * 0.7f * dsputil::TWO_PI) * clickEnvVal * 3.0f;
+                    clickSig = std::sin (t * p.clickFreq * dsputil::TWO_PI + fmClickMod) * clickEnvVal;
+                    break;
+                }
+                case 3: // Pitch chirp (descending)
+                {
+                    float chirpFreq = p.clickFreq * (1.0f + 8.0f * clickEnvVal);
+                    clickSig = std::sin (t * chirpFreq * dsputil::TWO_PI) * clickEnvVal;
+                    break;
+                }
+                default:
+                    clickSig = clickBP.process (noiseRaw) * clickEnvVal;
+                    break;
+            }
+            float click = clickSig * p.clickAmount;
             float top = noise.next() * std::exp (-t / 0.0003f) * 0.12f * p.clickAmount;
 
             // Transient layer
@@ -767,10 +869,18 @@ public:
             if (p.transientSampleAmt > 0.01f && transientSample != nullptr && transientSample->valid && i < (int) transientSample->samples.size())
                 transSampleSig = transientSample->samples[i] * p.transientSampleAmt;
 
-            // Mix (optimizable levels)
-            float sample = body * bodyEnv * p.bodyMix + additiveSig * bodyEnv + unisonSig * bodyEnv * 0.4f
-                         + sub * subEnv * p.subLevel * p.subMix + click * p.clickMix + top * p.topMix + transLayerSig
-                         + noiseSample + residualSig + transSampleSig + resonSig + r2Sig + r3Sig + formantSig;
+            // Apply body highpass (crossover): removes sub content from body,
+            // letting the sub oscillator handle it independently
+            float bodyOut = body * bodyEnv;
+            if (useBodyHP) bodyOut = bodyHP.process (bodyOut);
+
+            // Mix — params control relative balance, final normalize sets global level
+            float sample = bodyOut * p.bodyMix
+                         + additiveSig * bodyEnv + unisonSig * bodyEnv * 0.4f
+                         + sub * subEnv * p.subLevel * p.subMix
+                         + click * p.clickMix + top * p.topMix + transLayerSig
+                         + noiseSample + residualSig + transSampleSig
+                         + resonSig + r2Sig + r3Sig + formantSig;
 
             if (p.harmonicEmphasis > 0.01f)
                 sample += harmonicBP.process (body * bodyEnv) * p.harmonicEmphasis * 0.3f;
@@ -815,7 +925,34 @@ public:
                 sample = dry + (eqd - dry) * p.eqAmount;
             }
 
-            sample = dcBlock.process (sample) * 0.85f;
+            // Master saturation (post-mix, pre-DC block)
+            if (p.masterSatAmount > 0.01f)
+            {
+                int msType = (int) p.masterSatType;
+                dsputil::SaturationMode mode = (msType == 1) ? dsputil::SaturationMode::Tape
+                                             : (msType == 2) ? dsputil::SaturationMode::Tube
+                                             :                  dsputil::SaturationMode::SoftClip;
+                sample = saturator.process (sample, p.masterSatAmount, mode);
+            }
+
+            // Internal compressor (feedforward, RMS-based)
+            if (p.compAmount > 0.01f)
+            {
+                float absS = std::abs (sample);
+                compEnvState += (absS - compEnvState) * ((absS > compEnvState) ? compAttCoeff : compRelCoeff);
+                float envDB = 20.0f * std::log10 (std::max (1e-8f, compEnvState));
+                float overDB = std::max (0.0f, envDB - compThreshDB);
+                float gainDB = -overDB * (1.0f - 1.0f / p.compRatio);
+                float gain = std::pow (10.0f, gainDB / 20.0f);
+                sample = sample * (1.0f - p.compAmount) + sample * gain * p.compAmount;
+            }
+
+            // Brickwall limiter: hard-clip to ±0.95 then soft-knee
+            // This replicates the flat-topped waveform of produced/mastered kicks
+            if (std::abs (sample) > 0.7f)
+                sample = (sample > 0.0f ? 1.0f : -1.0f) * (0.7f + 0.25f * std::tanh ((std::abs (sample) - 0.7f) * 4.0f));
+
+            sample = dcBlock.process (sample);
             buffer.setSample (0, i, sample);
             buffer.setSample (1, i, sample);
         }
@@ -826,7 +963,7 @@ public:
             applySpectralEnvelopeMatch (buffer, p.spectralMatchAmt, sr);
         }
 
-        // === Post-loop: Reverb ===
+        // === Post-loop: Reverb (FDN with allpass diffusion) ===
         if (p.reverbAmt > 0.01f)
         {
             static constexpr int MAX_REV = 4096;
@@ -838,19 +975,46 @@ public:
             int t3 = std::min ((int)(0.0411f * sr), MAX_REV - 1);
             int t4 = std::min ((int)(0.0437f * sr), MAX_REV - 1);
             float fbk = std::min (0.95f, p.reverbDecay * 0.5f);
+
+            // Allpass diffusers for density
+            static constexpr int AP_SIZE = 1024;
+            float ap1Buf[AP_SIZE] = {}, ap2Buf[AP_SIZE] = {};
+            int ap1Pos = 0, ap2Pos = 0;
+            int ap1Del = std::min ((int)(0.0051f * sr), AP_SIZE - 1);
+            int ap2Del = std::min ((int)(0.0073f * sr), AP_SIZE - 1);
+            float apCoeff = 0.5f;
+
             for (int i = 0; i < numSamples; ++i)
             {
                 float dry = buffer.getSample (0, i);
                 float wet = (revBuf[(revPos - t1 + MAX_REV) % MAX_REV] + revBuf[(revPos - t2 + MAX_REV) % MAX_REV]
                            + revBuf[(revPos - t3 + MAX_REV) % MAX_REV] + revBuf[(revPos - t4 + MAX_REV) % MAX_REV]) * 0.25f;
-                dampSt = dampSt * p.reverbDamp + wet * (1.0f - p.reverbDamp);
+
+                // Allpass 1
+                float ap1In = wet;
+                float ap1Delayed = ap1Buf[(ap1Pos - ap1Del + AP_SIZE) % AP_SIZE];
+                float ap1Out = -apCoeff * ap1In + ap1Delayed + apCoeff * ap1Buf[ap1Pos % AP_SIZE];
+                ap1Buf[ap1Pos % AP_SIZE] = ap1In + apCoeff * ap1Delayed;
+                ap1Pos = (ap1Pos + 1) % AP_SIZE;
+
+                // Allpass 2
+                float ap2In = ap1Out;
+                float ap2Delayed = ap2Buf[(ap2Pos - ap2Del + AP_SIZE) % AP_SIZE];
+                float ap2Out = -apCoeff * ap2In + ap2Delayed + apCoeff * ap2Buf[ap2Pos % AP_SIZE];
+                ap2Buf[ap2Pos % AP_SIZE] = ap2In + apCoeff * ap2Delayed;
+                ap2Pos = (ap2Pos + 1) % AP_SIZE;
+
+                dampSt = dampSt * p.reverbDamp + ap2Out * (1.0f - p.reverbDamp);
                 revBuf[revPos] = dry * 0.5f + dampSt * fbk;
                 revPos = (revPos + 1) % MAX_REV;
-                float out = dry * (1.0f - p.reverbAmt * 0.5f) + wet * p.reverbAmt;
+                float out = dry * (1.0f - p.reverbAmt * 0.5f) + ap2Out * p.reverbAmt;
                 buffer.setSample (0, i, out);
                 buffer.setSample (1, i, out);
             }
         }
+
+        // Normalize after reverb to prevent clipping from reverb energy buildup
+        synthutil::normalizeBuffer (buffer, 0.95f);
 
         // === Post-loop: Stereo ===
         if (p.stereoWidth > 0.01f)

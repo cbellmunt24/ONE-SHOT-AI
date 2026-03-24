@@ -27,6 +27,8 @@ namespace oneshotmatch
 
 // Number of spectral bands per region / spectrotemporal frame
 static constexpr int NUM_SPECTRAL_BANDS = 8;
+// High-resolution body bands (50-2000 Hz focused) for finer spectral matching
+static constexpr int NUM_BODY_HIRES_BANDS = 16;
 // Spectrotemporal matrix dimensions
 static constexpr int SPECTRO_FRAMES = 8;
 static constexpr int SPECTRO_BANDS  = 8;
@@ -97,6 +99,10 @@ struct MatchDescriptors
     RegionDescriptors bodyRegion;
     RegionDescriptors tailRegion;
 
+    // === High-resolution body bands (16 bands, 50-2000 Hz) ===
+    // Finer spectral resolution in the critical body region
+    std::array<float, NUM_BODY_HIRES_BANDS> bodyHiResBands = {};
+
     // === Spectrotemporal matrix (8 frames x 8 bands) ===
     // Captures how the spectrum evolves over time — critical for precise matching
     std::array<float, SPECTRO_SIZE> spectroTemporal = {};
@@ -109,12 +115,28 @@ struct MatchDescriptors
     // === Stereo correlation ===
     float stereoCorrelation = 1.0f;  // 1.0 = mono, 0.0 = fully decorrelated
 
+    // === Harmonic profile (amplitudes of harmonics 1-6 relative to fundamental) ===
+    static constexpr int NUM_HARMONICS = 6;
+    std::array<float, NUM_HARMONICS> harmonicProfile = {};  // h1=1.0 (normalized), h2..h6
+
+    // === Sub harmonic ratio (energy at f0/2 vs f0) ===
+    float subHarmonicRatio = 0.0f;
+
+    // === Noise spectral centroid (Hz, centroid of non-harmonic content) ===
+    float noiseSpectralCentroid = 0.0f;
+
+    // === Spectral crest factor (peak/mean of body spectrum, tonality indicator) ===
+    float spectralCrest = 1.0f;
+
     bool valid = false;
 };
 
 class DescriptorExtractor
 {
 public:
+    // fastMode: skip expensive spectrotemporal (8 FFTs) + per-region (3 FFTs) + body hi-res
+    // Used during optimization to speed up evaluation ~4x
+    void setFastMode (bool fast) { fastMode = fast; }
 
     MatchDescriptors extract (const juce::AudioBuffer<float>& buffer, double sampleRate)
     {
@@ -187,14 +209,52 @@ public:
         int tailStart    = bodyEnd;
 
         // === Pitch analysis ===
+        // Body fundamental: 30-100ms after peak (large window for low-freq detection)
         int pitchBodyStart = std::min (peakIdx + (int)(0.030f * sr), numSamples - 1);
         int pitchBodyEnd   = std::min (peakIdx + (int)(0.100f * sr), numSamples - 1);
         d.fundamentalFreq = estimateF0Autocorrelation (mono, pitchBodyStart, pitchBodyEnd, sr);
         d.pitchEnd = d.fundamentalFreq;
 
-        int onsetEnd = std::min (peakIdx + (int)(0.005f * sr), numSamples - 1);
-        d.pitchStart = estimateF0Autocorrelation (mono, peakIdx, onsetEnd, sr);
-        if (d.pitchStart < 15.0f) d.pitchStart = d.fundamentalFreq * 4.0f;
+        // Onset pitch: use zero-crossing rate in first 3ms for instantaneous frequency
+        // This captures the very start of a pitch sweep (autocorrelation needs too long a window)
+        {
+            // ZCR in first 3ms (captures frequencies up to ~sr/2, good for 100-2000Hz sweeps)
+            int zcrEnd = std::min (peakIdx + (int)(0.003f * sr), numSamples - 1);
+            int zcrSamples = zcrEnd - peakIdx;
+            if (zcrSamples > 4)
+            {
+                int crossings = 0;
+                for (int z = peakIdx + 1; z < zcrEnd; ++z)
+                    if ((mono[z - 1] >= 0.0f) != (mono[z] >= 0.0f)) ++crossings;
+                float zcr3ms = (float) crossings * sr / (2.0f * (float) zcrSamples);
+                if (zcr3ms > 40.0f)
+                    d.pitchStart = zcr3ms;
+            }
+
+            // Fallback: ZCR in first 5ms
+            if (d.pitchStart < 40.0f)
+            {
+                int zcrEnd5 = std::min (peakIdx + (int)(0.005f * sr), numSamples - 1);
+                int zcrSamples5 = zcrEnd5 - peakIdx;
+                if (zcrSamples5 > 8)
+                {
+                    int crossings5 = 0;
+                    for (int z = peakIdx + 1; z < zcrEnd5; ++z)
+                        if ((mono[z - 1] >= 0.0f) != (mono[z] >= 0.0f)) ++crossings5;
+                    float zcr5ms = (float) crossings5 * sr / (2.0f * (float) zcrSamples5);
+                    if (zcr5ms > 30.0f) d.pitchStart = zcr5ms;
+                }
+            }
+
+            // Last fallback: autocorrelation in 10ms window
+            if (d.pitchStart < 30.0f)
+            {
+                int onsetEnd = std::min (peakIdx + (int)(0.010f * sr), numSamples - 1);
+                d.pitchStart = estimateF0Autocorrelation (mono, peakIdx, onsetEnd, sr);
+            }
+
+            if (d.pitchStart < 15.0f) d.pitchStart = d.fundamentalFreq * 2.0f;
+        }
 
         if (d.fundamentalFreq > 10.0f && d.pitchStart > 10.0f)
             d.pitchDropSemitones = 12.0f * std::log2 (d.pitchStart / d.fundamentalFreq);
@@ -203,7 +263,8 @@ public:
 
         d.pitchDropTime = estimatePitchDropTime (mono, peakIdx, sr, d.fundamentalFreq);
 
-        extractPitchEnvelope (mono, peakIdx, d.pitchEnvelope, sr);
+        // Pitch envelope: adaptive window size based on fundamental frequency
+        extractPitchEnvelope (mono, peakIdx, d.pitchEnvelope, sr, d.fundamentalFreq);
 
         // === Full-sample spectral analysis ===
         int fftOrder = 11; // 2048
@@ -223,27 +284,44 @@ public:
             d.spectralTilt = computeSpectralTilt (fullSpec.magnitudes, sr, fftSize);
         }
 
-        // === Per-region spectral analysis ===
-        int regionFFTOrder = 9; // 512
-        int regionFFTSize = 1 << regionFFTOrder;
+        // === Per-region spectral analysis (skip in fast mode — 3 FFTs) ===
+        if (! fastMode)
+        {
+            int regionFFTOrder = 9; // 512
+            int regionFFTSize = 1 << regionFFTOrder;
 
-        if (transientEnd - peakIdx >= regionFFTSize / 2)
-            d.transientRegion = extractRegionDescriptors (mono, std::max (0, peakIdx - 64), transientEnd, sr, regionFFTOrder);
-        else
-            d.transientRegion = extractRegionDescriptors (mono, std::max (0, peakIdx - 64), std::min (numSamples, peakIdx + regionFFTSize), sr, regionFFTOrder);
+            if (transientEnd - peakIdx >= regionFFTSize / 2)
+                d.transientRegion = extractRegionDescriptors (mono, std::max (0, peakIdx - 64), transientEnd, sr, regionFFTOrder);
+            else
+                d.transientRegion = extractRegionDescriptors (mono, std::max (0, peakIdx - 64), std::min (numSamples, peakIdx + regionFFTSize), sr, regionFFTOrder);
 
-        if (bodyEnd > transientEnd && bodyEnd - transientEnd >= regionFFTSize / 2)
-            d.bodyRegion = extractRegionDescriptors (mono, transientEnd, bodyEnd, sr, regionFFTOrder);
+            if (bodyEnd > transientEnd && bodyEnd - transientEnd >= regionFFTSize / 2)
+                d.bodyRegion = extractRegionDescriptors (mono, transientEnd, bodyEnd, sr, regionFFTOrder);
 
-        if (numSamples > tailStart + regionFFTSize / 2)
-            d.tailRegion = extractRegionDescriptors (mono, tailStart, std::min (numSamples, tailStart + fftSize), sr, regionFFTOrder);
+            if (numSamples > tailStart + regionFFTSize / 2)
+                d.tailRegion = extractRegionDescriptors (mono, tailStart, std::min (numSamples, tailStart + fftSize), sr, regionFFTOrder);
 
-        d.transientRegion.spectralFlux = 0.0f;
-        d.bodyRegion.spectralFlux = computeBandFlux (d.transientRegion.bandEnergy, d.bodyRegion.bandEnergy);
-        d.tailRegion.spectralFlux = computeBandFlux (d.bodyRegion.bandEnergy, d.tailRegion.bandEnergy);
+            d.transientRegion.spectralFlux = 0.0f;
+            d.bodyRegion.spectralFlux = computeBandFlux (d.transientRegion.bandEnergy, d.bodyRegion.bandEnergy);
+            d.tailRegion.spectralFlux = computeBandFlux (d.bodyRegion.bandEnergy, d.tailRegion.bandEnergy);
+        }
 
-        // === Spectrotemporal matrix (8 frames x 8 bands) ===
-        extractSpectroTemporal (mono, peakIdx, d.spectroTemporal, sr);
+        // === High-resolution body bands (16 bands, 50-2000 Hz) ===
+        if (numSamples >= fftSize)
+        {
+            auto bodySpec = computeSpectrum (mono, transientEnd, fftSize, sr, fftOrder);
+            computeBodyHiResBands (bodySpec.magnitudes, sr, fftSize, d.bodyHiResBands);
+
+            // === Harmonic profile, sub ratio, noise centroid, spectral crest ===
+            extractHarmonicProfile (bodySpec.magnitudes, d.fundamentalFreq, sr, fftSize, d.harmonicProfile);
+            d.subHarmonicRatio = computeSubHarmonicRatio (bodySpec.magnitudes, d.fundamentalFreq, sr, fftSize);
+            d.noiseSpectralCentroid = computeNoiseSpectralCentroid (bodySpec.magnitudes, d.fundamentalFreq, sr, fftSize);
+            d.spectralCrest = computeSpectralCrest (bodySpec.magnitudes);
+        }
+
+        // === Spectrotemporal matrix (skip in fast mode — 8 FFTs) ===
+        if (! fastMode)
+            extractSpectroTemporal (mono, peakIdx, d.spectroTemporal, sr);
 
         // === Micro transient (8 points in first 10ms after peak) ===
         extractMicroTransient (mono, peakIdx, d.microTransient, sr);
@@ -253,6 +331,7 @@ public:
     }
 
 private:
+    bool fastMode = false;
 
     // ========== Spectrum computation ==========
 
@@ -515,6 +594,150 @@ private:
         }
     }
 
+    // ========== High-resolution body band computation (50-2000 Hz, 16 bands) ==========
+
+    void computeBodyHiResBands (const std::vector<float>& mags, float sr, int fftSize,
+                                std::array<float, NUM_BODY_HIRES_BANDS>& bands)
+    {
+        float melLow = hzToMel (50.0f);
+        float melHigh = hzToMel (2000.0f);
+        float melStep = (melHigh - melLow) / (float) NUM_BODY_HIRES_BANDS;
+
+        int numBins = (int) mags.size();
+        float totalE = 0.0f;
+
+        for (int b = 0; b < NUM_BODY_HIRES_BANDS; ++b)
+        {
+            float edgeLo = melToHz (melLow + (float) b * melStep);
+            float edgeHi = melToHz (melLow + (float)(b + 1) * melStep);
+            int lo = std::max (0, std::min ((int)(edgeLo / sr * (float) fftSize), numBins - 1));
+            int hi = std::max (lo + 1, std::min ((int)(edgeHi / sr * (float) fftSize), numBins));
+
+            float e = 0.0f;
+            for (int i = lo; i < hi; ++i) e += mags[i] * mags[i];
+            bands[b] = e;
+            totalE += e;
+        }
+
+        if (totalE > 0.0f)
+            for (auto& b : bands) b /= totalE;
+    }
+
+    // ========== Harmonic profile extraction ==========
+    // Measures amplitudes of harmonics 1-6 relative to fundamental
+
+    void extractHarmonicProfile (const std::vector<float>& mags, float f0, float sr, int fftSize,
+                                 std::array<float, MatchDescriptors::NUM_HARMONICS>& profile)
+    {
+        profile.fill (0.0f);
+        if (f0 < 20.0f) return; // no valid fundamental
+
+        int numBins = (int) mags.size();
+        float binRes = sr / (float) fftSize;
+
+        // Find peak magnitude in a window around each harmonic
+        auto peakNear = [&](float freq) -> float
+        {
+            int centerBin = (int)(freq / binRes + 0.5f);
+            int window = std::max (1, (int)(freq * 0.05f / binRes)); // +/-5% of harmonic freq
+            float best = 0.0f;
+            for (int b = std::max (0, centerBin - window); b <= std::min (numBins - 1, centerBin + window); ++b)
+                best = std::max (best, mags[b]);
+            return best;
+        };
+
+        float h1 = peakNear (f0);
+        profile[0] = 1.0f; // fundamental normalized to 1
+
+        if (h1 < 1e-8f) return;
+
+        for (int h = 2; h <= MatchDescriptors::NUM_HARMONICS; ++h)
+        {
+            float hFreq = f0 * (float) h;
+            if (hFreq > sr * 0.45f) break; // above Nyquist margin
+            profile[h - 1] = peakNear (hFreq) / h1;
+        }
+    }
+
+    // ========== Sub harmonic ratio ==========
+    // Ratio of energy at f0/2 vs energy at f0
+
+    float computeSubHarmonicRatio (const std::vector<float>& mags, float f0, float sr, int fftSize)
+    {
+        if (f0 < 40.0f) return 0.0f; // sub-octave would be below 20 Hz
+
+        float binRes = sr / (float) fftSize;
+        int numBins = (int) mags.size();
+
+        auto bandEnergy = [&](float freq) -> float
+        {
+            int centerBin = (int)(freq / binRes + 0.5f);
+            int window = std::max (1, (int)(freq * 0.10f / binRes)); // +/-10%
+            float e = 0.0f;
+            for (int b = std::max (0, centerBin - window); b <= std::min (numBins - 1, centerBin + window); ++b)
+                e += mags[b] * mags[b];
+            return e;
+        };
+
+        float fundEnergy = bandEnergy (f0);
+        float subEnergy  = bandEnergy (f0 * 0.5f);
+
+        return (fundEnergy > 1e-10f) ? (subEnergy / fundEnergy) : 0.0f;
+    }
+
+    // ========== Noise spectral centroid ==========
+    // Centroid of non-harmonic (noise) content: masks out bins near harmonics 1-10
+
+    float computeNoiseSpectralCentroid (const std::vector<float>& mags, float f0, float sr, int fftSize)
+    {
+        if (f0 < 20.0f) return 0.0f;
+
+        int numBins = (int) mags.size();
+        float binRes = sr / (float) fftSize;
+
+        // Build harmonic mask — mark bins within +/-2 of each harmonic
+        std::vector<bool> isHarmonic (numBins, false);
+        for (int h = 1; h <= 10; ++h)
+        {
+            float hFreq = f0 * (float) h;
+            if (hFreq > sr * 0.45f) break;
+            int centerBin = (int)(hFreq / binRes + 0.5f);
+            for (int b = std::max (0, centerBin - 2); b <= std::min (numBins - 1, centerBin + 2); ++b)
+                isHarmonic[b] = true;
+        }
+
+        // Compute centroid of remaining bins
+        float centroidNum = 0.0f, totalE = 0.0f;
+        for (int i = 1; i < numBins; ++i)
+        {
+            if (isHarmonic[i]) continue;
+            float freq = (float) i * binRes;
+            float e = mags[i] * mags[i];
+            centroidNum += freq * e;
+            totalE += e;
+        }
+
+        return (totalE > 1e-10f) ? (centroidNum / totalE) : 0.0f;
+    }
+
+    // ========== Spectral crest factor ==========
+    // peak / mean of magnitude spectrum — high = tonal, low = noise-like
+
+    float computeSpectralCrest (const std::vector<float>& mags)
+    {
+        if (mags.empty()) return 1.0f;
+
+        float maxVal = 0.0f, sum = 0.0f;
+        for (auto m : mags)
+        {
+            maxVal = std::max (maxVal, m);
+            sum += m;
+        }
+
+        float mean = sum / (float) mags.size();
+        return (mean > 1e-10f) ? (maxVal / mean) : 1.0f;
+    }
+
     // ========== Pitch estimation (autocorrelation) ==========
 
     float estimateF0Autocorrelation (const std::vector<float>& mono, int start, int end, float sr)
@@ -587,9 +810,16 @@ private:
     // ========== Pitch envelope ==========
 
     void extractPitchEnvelope (const std::vector<float>& mono, int peakIdx,
-                               std::array<float, MatchDescriptors::PITCH_ENV_POINTS>& env, float sr)
+                               std::array<float, MatchDescriptors::PITCH_ENV_POINTS>& env, float sr,
+                               float fundamentalFreq = 50.0f)
     {
-        int windowSize = (int)(0.004f * sr);
+        // Window must contain at least 2.5 cycles of the fundamental for reliable autocorrelation
+        // Old: fixed 4ms = 176 samples → maxLag=88 → can only detect >500Hz! (useless for kicks)
+        // New: adaptive, at least 2.5 cycles of fundamental or 20ms minimum
+        float minPeriod = (fundamentalFreq > 20.0f) ? (1.0f / fundamentalFreq) : 0.02f;
+        int windowSize = std::max ((int)(0.020f * sr), (int)(2.5f * minPeriod * sr));
+        windowSize = std::min (windowSize, (int)(0.050f * sr)); // cap at 50ms
+
         float maxTime = 0.100f;
         float step = maxTime / (float) MatchDescriptors::PITCH_ENV_POINTS;
 
@@ -597,8 +827,8 @@ private:
         {
             float t = (float) p * step;
             int start = peakIdx + (int)(t * sr);
-            int end = start + windowSize;
-            if (end < (int) mono.size())
+            int end = std::min (start + windowSize, (int) mono.size());
+            if (end - start >= windowSize / 2)
                 env[p] = estimateF0Autocorrelation (mono, start, end, sr);
             else
                 env[p] = env[std::max (0, p - 1)];
@@ -669,17 +899,21 @@ private:
     {
         if (targetFreq < 20.0f) return 0.02f;
 
-        int windowSize = (int)(0.004f * sr);
+        // Window must be large enough to detect targetFreq (need at least 2 cycles)
+        float minPeriod = 1.0f / targetFreq;
+        int windowSize = std::max ((int)(0.020f * sr), (int)(2.5f * minPeriod * sr));
+        windowSize = std::min (windowSize, (int)(0.050f * sr));
+        int hopSize = windowSize / 3; // overlap for better temporal resolution
         int maxWindows = 25;
 
         for (int w = 0; w < maxWindows; ++w)
         {
-            int start = peakIdx + w * (windowSize / 2);
-            int end = start + windowSize;
-            if (end >= (int) mono.size()) break;
+            int start = peakIdx + w * hopSize;
+            int end = std::min (start + windowSize, (int) mono.size());
+            if (end - start < windowSize / 2) break;
 
             float freq = estimateF0Autocorrelation (mono, start, end, sr);
-            if (freq > 0.0f && std::abs (freq - targetFreq) / targetFreq < 0.12f)
+            if (freq > 0.0f && std::abs (freq - targetFreq) / targetFreq < 0.15f)
                 return (float)(start - peakIdx) / sr;
         }
         return 0.04f;
@@ -797,28 +1031,33 @@ inline float computeDistance (const MatchDescriptors& ref, const MatchDescriptor
     for (int i = 0; i < NUM_SPECTRAL_BANDS; ++i)
         bandWeight[i] = 0.3f + 0.7f * aWeightBand (i, NUM_SPECTRAL_BANDS); // blend: 30% flat + 70% A-weighted
 
-    // === Global temporal (weight: 12) — adaptive: envelope ===
-    dist += 1.5f * w.envelope * nsd (ref.attackTime, gen.attackTime, 0.005f);
-    dist += 2.5f * w.envelope * nsd (ref.decayTime, gen.decayTime, std::max (0.02f, ref.decayTime));
-    dist += 1.0f * w.envelope * nsd (ref.decayTime40, gen.decayTime40, std::max (0.05f, ref.decayTime40));
-    dist += 1.0f * w.envelope * nsd (ref.transientStrength, gen.transientStrength, std::max (2.0f, ref.transientStrength));
+    // === Duration penalty — prevents optimizer from making sound too long/short ===
+    dist += 3.0f * w.envelope * nsd (ref.totalDuration, gen.totalDuration, std::max (0.05f, ref.totalDuration * 0.3f));
+
+    // === Global temporal (weight: ~10) — adaptive: envelope ===
+    dist += 2.0f * w.envelope * nsd (ref.attackTime, gen.attackTime, std::max (0.002f, ref.attackTime * 0.5f));
+    dist += 2.0f * w.envelope * nsd (ref.decayTime, gen.decayTime, std::max (0.005f, ref.decayTime * 0.5f));
+    dist += 1.0f * w.envelope * nsd (ref.decayTime40, gen.decayTime40, std::max (0.01f, ref.decayTime40 * 0.5f));
+    dist += 1.5f * w.envelope * nsd (ref.transientStrength, gen.transientStrength, std::max (1.0f, ref.transientStrength * 0.3f));
     dist += 0.5f * w.envelope * nsd (ref.envelopeShape, gen.envelopeShape, 0.5f);
 
-    // === Amplitude envelope shape (weight: 7) — adaptive: envelope ===
+    // === Amplitude envelope shape (weight: 6) — adaptive: envelope ===
     {
         float envDist = 0.0f;
         for (int i = 0; i < MatchDescriptors::ENV_POINTS; ++i)
             envDist += (ref.ampEnvelope[i] - gen.ampEnvelope[i]) * (ref.ampEnvelope[i] - gen.ampEnvelope[i]);
-        dist += 7.0f * w.envelope * envDist / (float) MatchDescriptors::ENV_POINTS;
+        dist += 6.0f * w.envelope * envDist / (float) MatchDescriptors::ENV_POINTS;
     }
 
-    // === Pitch (weight: 10) — adaptive: pitch ===
+    // === Pitch (weight: ~14) — adaptive: pitch ===
+    // Boosted — pitch contour is THE difference between a kick and a sub drop
     dist += 4.0f * w.pitch * nsd (ref.fundamentalFreq, gen.fundamentalFreq, std::max (10.0f, ref.fundamentalFreq));
-    dist += 2.0f * w.pitch * nsd (ref.pitchDropSemitones, gen.pitchDropSemitones, std::max (6.0f, std::abs (ref.pitchDropSemitones) + 1.0f));
-    dist += 1.5f * w.pitch * nsd (ref.pitchDropTime, gen.pitchDropTime, 0.03f);
-    dist += 1.0f * w.pitch * nsd (ref.pitchStart, gen.pitchStart, std::max (50.0f, ref.pitchStart));
+    dist += 3.0f * w.pitch * nsd (ref.pitchDropSemitones, gen.pitchDropSemitones, std::max (6.0f, std::abs (ref.pitchDropSemitones) + 1.0f));
+    dist += 3.0f * w.pitch * nsd (ref.pitchDropTime, gen.pitchDropTime, 0.01f);  // tighter scale: 10ms matters hugely
+    dist += 2.0f * w.pitch * nsd (ref.pitchStart, gen.pitchStart, std::max (50.0f, ref.pitchStart));
 
-    // === Pitch envelope shape (weight: 3) ===
+    // === Pitch envelope shape (weight: 6) ===
+    // Boosted from 3 — this captures the SPEED of the pitch drop, critical for kick vs sub drop
     {
         float penvDist = 0.0f;
         for (int i = 0; i < MatchDescriptors::PITCH_ENV_POINTS; ++i)
@@ -826,25 +1065,28 @@ inline float computeDistance (const MatchDescriptors& ref, const MatchDescriptor
             float scale = std::max (20.0f, ref.pitchEnvelope[i]);
             penvDist += nsd (ref.pitchEnvelope[i], gen.pitchEnvelope[i], scale);
         }
-        dist += 3.0f * w.pitch * penvDist / (float) MatchDescriptors::PITCH_ENV_POINTS;
+        dist += 6.0f * w.pitch * penvDist / (float) MatchDescriptors::PITCH_ENV_POINTS;
     }
 
-    // === Global spectral (weight: 8) — adaptive: spectral ===
-    dist += 2.0f * w.spectral * nsd (ref.spectralCentroid, gen.spectralCentroid, std::max (100.0f, ref.spectralCentroid));
-    dist += 1.0f * w.spectral * nsd (ref.spectralRolloff, gen.spectralRolloff, std::max (200.0f, ref.spectralRolloff));
-    dist += 1.5f * w.spectral * nsd (ref.brightness, gen.brightness, std::max (0.01f, ref.brightness + 0.01f));
-    dist += 1.0f * w.spectral * nsd (ref.harmonicNoiseRatio, gen.harmonicNoiseRatio, 0.3f);
-    dist += 0.5f * w.spectral * nsd (ref.spectralTilt, gen.spectralTilt, 5.0f);
+    // === Global spectral (weight: ~12) — adaptive: spectral ===
+    // Boosted from 5 — spectral character is the most perceptually salient
+    dist += 3.0f * w.spectral * nsd (ref.spectralCentroid, gen.spectralCentroid, std::max (30.0f, ref.spectralCentroid * 0.3f));
+    dist += 2.0f * w.spectral * nsd (ref.spectralRolloff, gen.spectralRolloff, std::max (200.0f, ref.spectralRolloff));
+    dist += 2.5f * w.spectral * nsd (ref.brightness, gen.brightness, std::max (0.01f, ref.brightness + 0.01f));
+    dist += 1.5f * w.spectral * nsd (ref.harmonicNoiseRatio, gen.harmonicNoiseRatio, 0.3f);
+    dist += 1.5f * w.spectral * nsd (ref.spectralTilt, gen.spectralTilt, 5.0f);
 
-    // === Energy band distribution (weight: 4) — adaptive: sub ===
-    dist += 2.5f * w.sub * nsd (ref.subEnergy, gen.subEnergy, 0.12f);
-    dist += 1.0f * w.spectral * nsd (ref.lowMidEnergy, gen.lowMidEnergy, 0.1f);
-    dist += 0.8f * w.spectral * nsd (ref.midEnergy, gen.midEnergy, 0.1f);
-    dist += 0.7f * w.spectral * nsd (ref.highEnergy, gen.highEnergy, 0.05f);
+    // === Energy band distribution (weight: ~14) — adaptive: sub ===
+    // subEnergy and lowMidEnergy are THE most perceptually important for kicks
+    dist += 4.0f * w.sub * nsd (ref.subEnergy, gen.subEnergy, 0.08f);
+    dist += 4.0f * w.spectral * nsd (ref.lowMidEnergy, gen.lowMidEnergy, 0.07f);
+    dist += 1.2f * w.spectral * nsd (ref.midEnergy, gen.midEnergy, 0.1f);
+    dist += 1.0f * w.spectral * nsd (ref.highEnergy, gen.highEnergy, 0.05f);
 
-    // === Transient region (weight: 6) — adaptive: transient ===
-    dist += 1.5f * w.transient * nsd (ref.transientRegion.spectralCentroid, gen.transientRegion.spectralCentroid, std::max (500.0f, ref.transientRegion.spectralCentroid));
-    dist += 1.0f * w.transient * nsd (ref.transientRegion.spectralFlatness, gen.transientRegion.spectralFlatness, 0.3f);
+    // === Transient region (weight: ~8) — adaptive: transient ===
+    // Boosted — transient character is very perceptually distinctive
+    dist += 2.0f * w.transient * nsd (ref.transientRegion.spectralCentroid, gen.transientRegion.spectralCentroid, std::max (500.0f, ref.transientRegion.spectralCentroid));
+    dist += 1.5f * w.transient * nsd (ref.transientRegion.spectralFlatness, gen.transientRegion.spectralFlatness, 0.3f);
     dist += 1.0f * w.transient * nsd (ref.transientRegion.rmsEnergy, gen.transientRegion.rmsEnergy, std::max (0.05f, ref.transientRegion.rmsEnergy));
     dist += 1.0f * w.transient * nsd (ref.transientRegion.peakLevel, gen.transientRegion.peakLevel, std::max (0.1f, ref.transientRegion.peakLevel));
     {
@@ -854,13 +1096,14 @@ inline float computeDistance (const MatchDescriptors& ref, const MatchDescriptor
             float diff = ref.transientRegion.bandEnergy[i] - gen.transientRegion.bandEnergy[i];
             bDist += diff * diff * bandWeight[i];
         }
-        dist += 1.5f * bDist;
+        dist += 2.5f * w.transient * bDist;
     }
 
-    // === Body region (weight: 5) ===
-    dist += 1.5f * nsd (ref.bodyRegion.spectralCentroid, gen.bodyRegion.spectralCentroid, std::max (100.0f, ref.bodyRegion.spectralCentroid));
-    dist += 1.0f * nsd (ref.bodyRegion.rmsEnergy, gen.bodyRegion.rmsEnergy, std::max (0.05f, ref.bodyRegion.rmsEnergy));
-    dist += 1.0f * nsd (ref.bodyRegion.spectralFlatness, gen.bodyRegion.spectralFlatness, 0.3f);
+    // === Body region (weight: ~7) ===
+    // Boosted — body is the "meat" of the sound
+    dist += 2.0f * w.spectral * nsd (ref.bodyRegion.spectralCentroid, gen.bodyRegion.spectralCentroid, std::max (100.0f, ref.bodyRegion.spectralCentroid));
+    dist += 1.5f * w.spectral * nsd (ref.bodyRegion.rmsEnergy, gen.bodyRegion.rmsEnergy, std::max (0.05f, ref.bodyRegion.rmsEnergy));
+    dist += 1.5f * w.spectral * nsd (ref.bodyRegion.spectralFlatness, gen.bodyRegion.spectralFlatness, 0.3f);
     {
         float bDist = 0.0f;
         for (int i = 0; i < NUM_SPECTRAL_BANDS; ++i)
@@ -868,7 +1111,19 @@ inline float computeDistance (const MatchDescriptors& ref, const MatchDescriptor
             float diff = ref.bodyRegion.bandEnergy[i] - gen.bodyRegion.bandEnergy[i];
             bDist += diff * diff * bandWeight[i];
         }
-        dist += 1.5f * bDist;
+        dist += 2.5f * w.spectral * bDist;
+    }
+
+    // === High-resolution body bands (weight: 6) — finer spectral matching in 50-2000 Hz ===
+    // Boosted — this is the most detailed timbral comparison
+    {
+        float hrDist = 0.0f;
+        for (int i = 0; i < NUM_BODY_HIRES_BANDS; ++i)
+        {
+            float diff = ref.bodyHiResBands[i] - gen.bodyHiResBands[i];
+            hrDist += diff * diff;
+        }
+        dist += 6.0f * w.spectral * hrDist / (float) NUM_BODY_HIRES_BANDS;
     }
 
     // === Tail region (weight: 3) ===
@@ -901,11 +1156,11 @@ inline float computeDistance (const MatchDescriptors& ref, const MatchDescriptor
                 stDist += diff * diff * bandWeight[b];
             }
         }
-        dist += 6.0f * w.spectroTemporal * stDist / (float) SPECTRO_SIZE;
+        dist += 8.0f * w.spectroTemporal * stDist / (float) SPECTRO_SIZE;
     }
 
-    // === Micro transient (weight: 3) ===
-    // Fine transient detail in first 10ms — L2 distance normalized by point count
+    // === Micro transient (weight: 5) ===
+    // Boosted — fine transient detail distinguishes kick from sub drop
     {
         float mtDist = 0.0f;
         for (int i = 0; i < MatchDescriptors::MICRO_POINTS; ++i)
@@ -913,8 +1168,32 @@ inline float computeDistance (const MatchDescriptors& ref, const MatchDescriptor
             float diff = ref.microTransient[i] - gen.microTransient[i];
             mtDist += diff * diff;
         }
-        dist += 3.0f * w.transient * mtDist / (float) MatchDescriptors::MICRO_POINTS;
+        dist += 5.0f * w.transient * mtDist / (float) MatchDescriptors::MICRO_POINTS;
     }
+
+    // === Harmonic profile (weight: 3) — only when both have valid fundamental ===
+    if (ref.fundamentalFreq > 20.0f && gen.fundamentalFreq > 20.0f)
+    {
+        float hpDist = 0.0f;
+        for (int i = 0; i < MatchDescriptors::NUM_HARMONICS; ++i)
+        {
+            float diff = ref.harmonicProfile[i] - gen.harmonicProfile[i];
+            hpDist += diff * diff;
+        }
+        dist += 3.0f * w.spectral * hpDist / (float) MatchDescriptors::NUM_HARMONICS;
+    }
+
+    // === Sub harmonic ratio (weight: 1.5) ===
+    dist += 1.5f * w.sub * nsd (ref.subHarmonicRatio, gen.subHarmonicRatio, 0.3f);
+
+    // === Noise spectral centroid (weight: 1.0, gated on noise content) ===
+    if (ref.harmonicNoiseRatio < 0.8f)
+        dist += 1.0f * w.spectral * nsd (ref.noiseSpectralCentroid, gen.noiseSpectralCentroid,
+                                          std::max (500.0f, ref.noiseSpectralCentroid));
+
+    // === Spectral crest (weight: 0.8) ===
+    dist += 0.8f * w.spectral * nsd (ref.spectralCrest, gen.spectralCrest,
+                                      std::max (2.0f, ref.spectralCrest));
 
     return dist;
 }
@@ -956,6 +1235,13 @@ struct GapAnalysis
     bool needsTransientCapture = false; // Reference transient sample needed
     // harmonics 5-8 activated with needsAdditive
     // subWavetable activated with wavetable available
+    // v6 extensions
+    bool needsPitchBounce   = false;  // Non-monotonic pitch envelope detected
+    bool needsClickType     = false;  // Transient character mismatch (beyond noise)
+    bool needsMasterSat     = false;  // Post-mix saturation needed
+    bool needsSubPhase      = false;  // Sub phase coherence optimization
+    bool needsCompressor    = false;  // Internal dynamics needed (sustain-like envelope)
+    bool needsSubCrossover  = false;  // Sub/body frequency boundary optimization
 
     // OR-merge another GapAnalysis into this one
     void merge (const GapAnalysis& other)
@@ -983,6 +1269,12 @@ struct GapAnalysis
         needsResidual      = needsResidual      || other.needsResidual;
         needsSpectralMatch = needsSpectralMatch || other.needsSpectralMatch;
         needsTransientCapture = needsTransientCapture || other.needsTransientCapture;
+        needsPitchBounce   = needsPitchBounce   || other.needsPitchBounce;
+        needsClickType     = needsClickType     || other.needsClickType;
+        needsMasterSat     = needsMasterSat     || other.needsMasterSat;
+        needsSubPhase      = needsSubPhase      || other.needsSubPhase;
+        needsCompressor    = needsCompressor    || other.needsCompressor;
+        needsSubCrossover  = needsSubCrossover  || other.needsSubCrossover;
     }
 
     int extensionCount() const
@@ -998,7 +1290,10 @@ struct GapAnalysis
                (int) needsMixControl + (int) needsFilterSweep +
                (int) needsSubPitch +
                (int) needsResidual + (int) needsSpectralMatch +
-               (int) needsTransientCapture;
+               (int) needsTransientCapture +
+               (int) needsPitchBounce + (int) needsClickType +
+               (int) needsMasterSat + (int) needsSubPhase +
+               (int) needsCompressor + (int) needsSubCrossover;
     }
 
     // Returns param indices that should be activated for optimization
@@ -1036,6 +1331,13 @@ struct GapAnalysis
         if (needsSpectralMatch)     { indices.push_back (92); }
         // subWavetable (93) activated when wavetable is available (handled by optimizer)
         if (needsTransientCapture)  { indices.push_back (94); }
+        // v6
+        if (needsPitchBounce)  { indices.push_back (95); indices.push_back (96); }
+        if (needsClickType)    { indices.push_back (97); }
+        if (needsMasterSat)    { indices.push_back (98); indices.push_back (99); }
+        if (needsSubPhase)     { indices.push_back (100); }
+        if (needsCompressor)   { for (int i = 101; i <= 104; ++i) indices.push_back (i); }
+        if (needsSubCrossover) { indices.push_back (105); }
         return indices;
     }
 };
@@ -1113,6 +1415,14 @@ inline GapAnalysis analyzeGaps (const MatchDescriptors& ref, const MatchDescript
     // If tonal (low flatness) with harmonic content mismatch and FM alone isn't enough
     if (ref.bodyRegion.spectralFlatness < 0.15f && bodyCentGap > 0.3f && g.needsFM)
         g.needsAdditive = true;
+    // Also trigger if harmonic profile shows significant upper harmonics (h3+)
+    if (ref.fundamentalFreq > 20.0f)
+    {
+        float upperHarm = ref.harmonicProfile[2] + ref.harmonicProfile[3]
+                        + ref.harmonicProfile[4] + ref.harmonicProfile[5];
+        if (upperHarm > 0.2f)
+            g.needsAdditive = true;
+    }
 
     // --- Multi-resonance: multiple spectral peaks ---
     // If single resonance activated but body spread still doesn't match
@@ -1124,6 +1434,9 @@ inline GapAnalysis analyzeGaps (const MatchDescriptors& ref, const MatchDescript
     float transZCRGap = relErr (ref.transientRegion.zeroCrossingRate, matched.transientRegion.zeroCrossingRate,
                                 std::max (500.0f, ref.transientRegion.zeroCrossingRate * 0.15f));
     if (transFlatGap > 0.3f || transZCRGap > 0.4f)
+        g.needsNoiseShape = true;
+    // Also trigger from noise centroid when significant aperiodic content exists
+    if (ref.noiseSpectralCentroid > 200.0f && ref.harmonicNoiseRatio < 0.6f)
         g.needsNoiseShape = true;
 
     // --- EQ: overall spectral shape correction (catch-all) ---
@@ -1273,6 +1586,84 @@ inline GapAnalysis analyzeGaps (const MatchDescriptors& ref, const MatchDescript
         if (mtErr > 0.05f && ref.transientStrength > 3.0f)
             g.needsTransientCapture = true;
     }
+
+    // ========== v6 gap analysis ==========
+
+    // --- Pitch bounce: non-monotonic pitch envelope (dip below fundamental) ---
+    {
+        // Check for non-monotonic behavior in pitch envelope
+        bool hasReversal = false;
+        for (int i = 2; i < MatchDescriptors::PITCH_ENV_POINTS - 1; ++i)
+        {
+            // Detect a dip: pitch goes below fundamental then comes back
+            if (ref.pitchEnvelope[i] < ref.pitchEnvelope[i + 1] &&
+                ref.pitchEnvelope[i] < ref.pitchEnvelope[i - 1])
+                hasReversal = true;
+        }
+        float pitchEnvErr = 0.0f;
+        for (int i = 0; i < MatchDescriptors::PITCH_ENV_POINTS; ++i)
+        {
+            float scale = std::max (15.0f, ref.pitchEnvelope[i] * 0.1f);
+            pitchEnvErr += relErr (ref.pitchEnvelope[i], matched.pitchEnvelope[i], scale);
+        }
+        pitchEnvErr /= (float) MatchDescriptors::PITCH_ENV_POINTS;
+        if (hasReversal || pitchEnvErr > 0.8f)
+            g.needsPitchBounce = true;
+    }
+
+    // --- Click type: transient character mismatch even after noise + snap activated ---
+    if (g.needsTransientSnap && transPeakGap > 0.3f)
+        g.needsClickType = true;
+    // Also if transient spectral centroid is very high (FM-like character)
+    if (ref.transientRegion.spectralCentroid > 5000.0f &&
+        relErr (ref.transientRegion.spectralCentroid, matched.transientRegion.spectralCentroid,
+                ref.transientRegion.spectralCentroid * 0.15f) > 0.4f)
+        g.needsClickType = true;
+
+    // --- Master saturation: overall harmonic content/tilt mismatch post-processing ---
+    if (tiltGap > 0.6f || (hnrGap > 0.4f && brightGap > 0.3f))
+        g.needsMasterSat = true;
+    // Also when high-res body bands show consistent error (processed character)
+    {
+        float hrErr = 0.0f;
+        for (int b = 0; b < NUM_BODY_HIRES_BANDS; ++b)
+            hrErr += std::abs (ref.bodyHiResBands[b] - matched.bodyHiResBands[b]);
+        hrErr /= (float) NUM_BODY_HIRES_BANDS;
+        if (hrErr > 0.08f)
+            g.needsMasterSat = true;
+    }
+
+    // --- Sub phase: sub energy prominent but punch (transient peak) doesn't match ---
+    if (ref.subEnergy > 0.15f && transPeakGap > 0.3f)
+        g.needsSubPhase = true;
+
+    // --- Compressor: envelope shape suggests dynamics processing ---
+    {
+        // Compressed sounds have: high mid-envelope relative to peak, less dynamic range
+        float envMidLevel = 0.0f;
+        for (int i = 3; i < 8; ++i)
+            envMidLevel += ref.ampEnvelope[i];
+        envMidLevel /= 5.0f;
+
+        // High crest factor in ref but matched has different envelope shape
+        float envErr = 0.0f;
+        for (int i = 2; i < MatchDescriptors::ENV_POINTS; ++i)
+            envErr += std::abs (ref.ampEnvelope[i] - matched.ampEnvelope[i]);
+        envErr /= (float)(MatchDescriptors::ENV_POINTS - 2);
+
+        // Compressed sounds: relatively flat sustain portion
+        bool looksCompressed = (envMidLevel > 0.25f && ref.transientStrength < 6.0f);
+        if (looksCompressed && envErr > 0.1f)
+            g.needsCompressor = true;
+        // Also activate if envelope error large and sustain/complex already couldn't fix
+        if (g.needsEnvComplex && envErr > 0.15f)
+            g.needsCompressor = true;
+    }
+
+    // --- Sub crossover: sub boundary mismatch ---
+    // If sub energy and low-mid energy both have error, crossover point may be wrong
+    if (subGap > 0.25f && relErr (ref.lowMidEnergy, matched.lowMidEnergy, 0.08f) > 0.3f)
+        g.needsSubCrossover = true;
 
     return g;
 }

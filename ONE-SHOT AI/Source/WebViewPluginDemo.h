@@ -632,6 +632,22 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
             json += ",\"matchedDescriptors\":" + engine.descriptorsToJSON (engine.getMatchedDescriptors());
             json += ",\"converged\":" + juce::String (engine.getOptResult().converged ? "true" : "false");
             json += ",\"gapAnalysis\":" + engine.gapAnalysisToJSON();
+
+            // Buffer diagnostics
+            auto& mbuf = engine.getMatchedBuffer();
+            if (mbuf.getNumSamples() > 0)
+            {
+                float pk = mbuf.getMagnitude (0, 0, mbuf.getNumSamples());
+                float rms = 0.0f;
+                const float* d = mbuf.getReadPointer (0);
+                for (int s = 0; s < mbuf.getNumSamples(); ++s) rms += d[s] * d[s];
+                rms = std::sqrt (rms / (float) mbuf.getNumSamples());
+                json += ",\"bufPeak\":" + juce::String (pk, 4);
+                json += ",\"bufRMS\":" + juce::String (rms, 4);
+                json += ",\"bufSamples\":" + juce::String (mbuf.getNumSamples());
+                json += ",\"bufSR\":" + juce::String (engine.getSampleRate(), 0);
+                json += ",\"bufDurationMs\":" + juce::String (1000.0 * mbuf.getNumSamples() / engine.getSampleRate(), 1);
+            }
         }
 
         if (state == oneshotmatch::MatchState::Error)
@@ -710,6 +726,71 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
                                                       juce::String { "application/json" } };
     }
 
+    // ── API: One-Shot Match — Export TXT report ──
+    if (urlToRetrieve.startsWith ("api/match/export-txt"))
+    {
+        auto desktop = juce::File::getSpecialLocation (juce::File::userDesktopDirectory);
+        auto outputDir = desktop.getChildFile ("ONE-SHOT AI Output");
+        outputDir.createDirectory();
+
+        auto refName = processorRef.matchEngine.getReferenceFile().getFileNameWithoutExtension();
+        if (refName.isEmpty()) refName = "OneShotMatch";
+        auto file = outputDir.getChildFile (refName + "_report.txt");
+
+        auto& eng = processorRef.matchEngine;
+        auto& refD = eng.getRefDescriptors();
+        auto& matD = eng.getMatchedDescriptors();
+        auto& res  = eng.getOptResult();
+        auto& bp   = eng.getBestParams();
+
+        juce::String txt;
+        txt += "=== ONE-SHOT MATCH REPORT ===\n\n";
+        txt += "Reference: " + eng.getReferenceFile().getFileName() + "\n";
+        txt += "Distance: " + juce::String (res.bestDistance, 4) + "\n";
+        txt += "Score: " + juce::String ((int) std::round (100.0f / (1.0f + res.bestDistance * 0.8f))) + "%\n";
+        txt += "Iterations: " + juce::String (res.iterations) + "\n";
+        txt += "Converged: " + juce::String (res.converged ? "yes" : "no") + "\n";
+        txt += "Extensions: " + juce::String (res.extensionsActivated) + "\n\n";
+
+        txt += "--- DESCRIPTORS (ref vs matched) ---\n";
+        txt += "fundamentalFreq: " + juce::String (refD.fundamentalFreq, 1) + " vs " + juce::String (matD.fundamentalFreq, 1) + " Hz\n";
+        txt += "pitchStart: " + juce::String (refD.pitchStart, 1) + " vs " + juce::String (matD.pitchStart, 1) + " Hz\n";
+        txt += "pitchDropST: " + juce::String (refD.pitchDropSemitones, 1) + " vs " + juce::String (matD.pitchDropSemitones, 1) + " st\n";
+        txt += "pitchDropTime: " + juce::String (refD.pitchDropTime * 1000, 1) + " vs " + juce::String (matD.pitchDropTime * 1000, 1) + " ms\n";
+        txt += "attackTime: " + juce::String (refD.attackTime * 1000, 2) + " vs " + juce::String (matD.attackTime * 1000, 2) + " ms\n";
+        txt += "decayTime: " + juce::String (refD.decayTime * 1000, 1) + " vs " + juce::String (matD.decayTime * 1000, 1) + " ms\n";
+        txt += "transientStr: " + juce::String (refD.transientStrength, 2) + " vs " + juce::String (matD.transientStrength, 2) + "\n";
+        txt += "spectralCentroid: " + juce::String (refD.spectralCentroid, 0) + " vs " + juce::String (matD.spectralCentroid, 0) + " Hz\n";
+        txt += "brightness: " + juce::String (refD.brightness, 3) + " vs " + juce::String (matD.brightness, 3) + "\n";
+        txt += "HNR: " + juce::String (refD.harmonicNoiseRatio, 3) + " vs " + juce::String (matD.harmonicNoiseRatio, 3) + "\n";
+        txt += "subEnergy: " + juce::String (refD.subEnergy, 3) + " vs " + juce::String (matD.subEnergy, 3) + "\n";
+        txt += "lowMidEnergy: " + juce::String (refD.lowMidEnergy, 3) + " vs " + juce::String (matD.lowMidEnergy, 3) + "\n";
+        txt += "midEnergy: " + juce::String (refD.midEnergy, 3) + " vs " + juce::String (matD.midEnergy, 3) + "\n";
+        txt += "highEnergy: " + juce::String (refD.highEnergy, 3) + " vs " + juce::String (matD.highEnergy, 3) + "\n";
+        txt += "rmsLoudness: " + juce::String (refD.rmsLoudness, 4) + " vs " + juce::String (matD.rmsLoudness, 4) + "\n";
+        txt += "totalDuration: " + juce::String (refD.totalDuration * 1000, 1) + " vs " + juce::String (matD.totalDuration * 1000, 1) + " ms\n\n";
+
+        txt += "--- SYNTH PARAMS ---\n";
+        float arr[oneshotmatch::MatchSynthParams::NUM_PARAMS];
+        bp.toArray (arr);
+        for (int i = 0; i < oneshotmatch::MatchSynthParams::NUM_PARAMS; ++i)
+        {
+            txt += juce::String (oneshotmatch::MatchSynthParams::getParamName (i)).paddedRight (' ', 22);
+            txt += juce::String (arr[i], 4);
+            txt += " " + juce::String (oneshotmatch::MatchSynthParams::getParamUnit (i));
+            if (res.sensitivity[i] > 0.1f)
+                txt += "  [sens=" + juce::String (res.sensitivity[i], 2) + "]";
+            txt += "\n";
+        }
+
+        file.replaceWithText (txt);
+
+        juce::String json = "{\"ok\":true,\"path\":\"" + file.getFullPathName().replace ("\\", "\\\\") + "\"}";
+        juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
     return std::nullopt;
 }
 
@@ -727,6 +808,182 @@ public:
         auto testDir = desktop.getChildFile ("ONE-SHOT AI Test Output");
         int count = TestWavExporter::exportAll (testDir);
         DBG ("ONE-SHOT AI: Exported " + juce::String (count) + " test wavs to Desktop");
+
+        // === MANUAL PARAMS TEST — export both WAVs for comparison ===
+        {
+            juce::File kickFile ("C:\\Users\\charl\\Desktop\\ESMUC\\# SONOLOGIA ESMUC\\LABSO II\\ONE-SHOT AI\\Training\\libraries\\kicks\\trap\\kicks_trap_0027.wav");
+            if (kickFile.existsAsFile() && matchEngine.loadReference (kickFile))
+            {
+                matchEngine.analyzeReference();
+                auto& refD = matchEngine.getRefDescriptors();
+                auto& refBuf = matchEngine.getReferenceBuffer();
+
+                // Export reference WAV
+                auto outputDir = desktop.getChildFile ("ONE-SHOT AI Output");
+                outputDir.createDirectory();
+                writeWavToFile (outputDir.getChildFile ("ref_kick.wav"), refBuf, 44100.0);
+
+                // Generate with manual params (the ones that gave perfect descriptors)
+                oneshotmatch::MatchSynthParams manual;
+                manual.oscType = 12;  // wavetable — captures exact timbre of reference
+                manual.basePitch = 54.2f;
+                manual.bodyHarmonics = 0.1f;      // minimal — just enough warmth
+                manual.pitchEnvDepth = 10.6f;
+                manual.pitchEnvFast = 0.002f;
+                manual.pitchEnvSlow = 0.030f;
+                manual.pitchEnvBalance = 0.6f;
+                manual.ampAttack = 0.0001f;
+                manual.ampPunchDecay = 0.015f;
+                manual.ampBodyDecay = 0.045f;
+                manual.ampPunchLevel = 0.7f;
+                manual.subLevel = 0.0f;          // NO sub — body handles everything
+                manual.subTailDecay = 0.05f;
+                manual.subDetune = 0.0f;
+                manual.clickAmount = 0.0f;
+                manual.distortion = 0.05f;        // very light — clean kick
+                manual.noiseAmount = 0.0f;
+                manual.filterCutoff = 400.0f;
+                manual.harmonicEmphasis = 0.1f;
+                manual.bodyMix = 1.0f;
+                manual.subMix = 0.0f;
+                manual.clickMix = 0.0f;
+                manual.topMix = 0.0f;
+                manual.subCrossover = 0.0f;     // NO crossover for sine
+                manual.envSustainLevel = 0.9f;   // strong sustain plateau
+                manual.envSustainTime  = 0.040f; // 40ms plateau
+                manual.envRelease      = 0.010f; // 10ms sharp release
+                // Compressor: smooths out amplitude oscillations
+                manual.compAmount = 0.8f;
+                manual.compRatio = 8.0f;
+                manual.compAttack = 0.0002f;     // 0.2ms — instant
+                manual.compRelease = 0.02f;      // 20ms
+                // Limiter in synth handles peak flattening now — no need for masterSat
+
+                oneshotmatch::OneShotMatchSynth synth;
+                synth.setWavetable (&matchEngine.getRefWavetable());
+                auto manualBuf = synth.generate (manual, 44100.0);
+                writeWavToFile (outputDir.getChildFile ("manual_match.wav"), manualBuf, 44100.0);
+
+                // Also run the optimizer
+                DBG ("AUTOTEST: Starting optimizer match...");
+                matchEngine.startMatch();
+                int waitMs = 0;
+                while (matchEngine.getState() == oneshotmatch::MatchState::Matching && waitMs < 300000)
+                {
+                    juce::Thread::sleep (500);
+                    waitMs += 500;
+                }
+
+                DBG ("AUTOTEST: Match completed in " + juce::String (waitMs / 1000) + "s");
+
+                // Extract results
+                auto& bestParams = matchEngine.getBestParams();
+                auto& bestBuffer = matchEngine.getMatchedBuffer();
+                float bestDist = matchEngine.getDistance();
+                int bestScore = (int) std::round (100.0f / (1.0f + bestDist * 0.8f));
+
+                // Export optimizer match WAV for comparison
+                if (bestBuffer.getNumSamples() > 0)
+                    writeWavToFile (outputDir.getChildFile ("optimizer_match.wav"), bestBuffer, 44100.0);
+
+                // === WAVEFORM COMPARISON: ref vs manual vs optimizer ===
+                // Dump peak amplitude per 1ms window for first 50ms + every 50ms after
+                {
+                    auto dumpEnvelope = [](const juce::AudioBuffer<float>& buf, float sr) -> juce::String
+                    {
+                        juce::String s;
+                        const float* data = buf.getReadPointer (0);
+                        int total = buf.getNumSamples();
+                        // First 50ms: 1ms windows
+                        for (int ms = 0; ms < 50 && ms * (int)(sr / 1000) < total; ++ms)
+                        {
+                            int start = ms * (int)(sr / 1000);
+                            int end = std::min (start + (int)(sr / 1000), total);
+                            float pk = 0.0f, rms = 0.0f;
+                            for (int i = start; i < end; ++i) { pk = std::max (pk, std::abs (data[i])); rms += data[i] * data[i]; }
+                            rms = std::sqrt (rms / (float)(end - start));
+                            s += juce::String (ms) + "ms: pk=" + juce::String (pk, 3) + " rms=" + juce::String (rms, 3) + "\n";
+                        }
+                        // Then every 50ms up to 800ms
+                        for (int ms = 50; ms < 800; ms += 50)
+                        {
+                            int start = ms * (int)(sr / 1000);
+                            int end = std::min (start + (int)(sr / 1000), total);
+                            if (start >= total) break;
+                            float pk = 0.0f;
+                            for (int i = start; i < end; ++i) pk = std::max (pk, std::abs (data[i]));
+                            s += juce::String (ms) + "ms: pk=" + juce::String (pk, 3) + "\n";
+                        }
+                        return s;
+                    };
+
+                    juce::String wf;
+                    wf += "=== WAVEFORM ENVELOPE COMPARISON ===\n\n";
+                    wf += "--- REFERENCE ---\n" + dumpEnvelope (refBuf, 44100.0f) + "\n";
+                    wf += "--- MANUAL ---\n" + dumpEnvelope (manualBuf, 44100.0f) + "\n";
+                    wf += "--- OPTIMIZER ---\n" + dumpEnvelope (bestBuffer, 44100.0f) + "\n";
+                    outputDir.getChildFile ("waveform_compare.txt").replaceWithText (wf);
+                }
+
+                // Analyze the best output
+                oneshotmatch::DescriptorExtractor ext;
+                oneshotmatch::MatchDescriptors optD;
+                if (bestBuffer.getNumSamples() > 0)
+                    optD = ext.extract (bestBuffer, 44100.0);
+
+                juce::String txt;
+                txt += "=== OPTIMIZER AUTO-TEST ===\n";
+                txt += "Kick: kicks_trap_0027.wav\n";
+                txt += "Time: " + juce::String (waitMs / 1000) + "s\n";
+                txt += "Distance: " + juce::String (bestDist, 4) + "\n";
+                txt += "Score: " + juce::String (bestScore) + "%\n\n";
+
+                txt += "--- KEY PARAMS ---\n";
+                txt += "oscType: " + juce::String ((int) bestParams.oscType) + "\n";
+                txt += "basePitch: " + juce::String (bestParams.basePitch, 1) + "\n";
+                txt += "bodyHarmonics: " + juce::String (bestParams.bodyHarmonics, 3) + "\n";
+                txt += "pitchEnvDepth: " + juce::String (bestParams.pitchEnvDepth, 1) + "\n";
+                txt += "pitchEnvFast: " + juce::String (bestParams.pitchEnvFast, 4) + "\n";
+                txt += "pitchEnvSlow: " + juce::String (bestParams.pitchEnvSlow, 4) + "\n";
+                txt += "ampAttack: " + juce::String (bestParams.ampAttack, 4) + "\n";
+                txt += "ampPunchDecay: " + juce::String (bestParams.ampPunchDecay, 4) + "\n";
+                txt += "ampBodyDecay: " + juce::String (bestParams.ampBodyDecay, 3) + "\n";
+                txt += "subLevel: " + juce::String (bestParams.subLevel, 3) + "\n";
+                txt += "subTailDecay: " + juce::String (bestParams.subTailDecay, 3) + "\n";
+                txt += "subMix: " + juce::String (bestParams.subMix, 3) + "\n";
+                txt += "bodyMix: " + juce::String (bestParams.bodyMix, 3) + "\n";
+                txt += "clickAmount: " + juce::String (bestParams.clickAmount, 3) + "\n";
+                txt += "clickMix: " + juce::String (bestParams.clickMix, 3) + "\n";
+                txt += "topMix: " + juce::String (bestParams.topMix, 3) + "\n";
+                txt += "noiseAmount: " + juce::String (bestParams.noiseAmount, 3) + "\n";
+                txt += "filterCutoff: " + juce::String (bestParams.filterCutoff, 0) + "\n";
+                txt += "distortion: " + juce::String (bestParams.distortion, 3) + "\n";
+                txt += "subCrossover: " + juce::String (bestParams.subCrossover, 1) + "\n";
+                txt += "harmonicEmphasis: " + juce::String (bestParams.harmonicEmphasis, 3) + "\n\n";
+
+                txt += "--- DESCRIPTORS (ref / optimized) ---\n";
+                txt += "fundamentalFreq: " + juce::String (refD.fundamentalFreq, 1) + " / " + juce::String (optD.fundamentalFreq, 1) + "\n";
+                txt += "pitchStart: " + juce::String (refD.pitchStart, 1) + " / " + juce::String (optD.pitchStart, 1) + "\n";
+                txt += "pitchDropST: " + juce::String (refD.pitchDropSemitones, 1) + " / " + juce::String (optD.pitchDropSemitones, 1) + "\n";
+                txt += "pitchDropTime: " + juce::String (refD.pitchDropTime * 1000, 1) + " / " + juce::String (optD.pitchDropTime * 1000, 1) + " ms\n";
+                txt += "attackTime: " + juce::String (refD.attackTime * 1000, 2) + " / " + juce::String (optD.attackTime * 1000, 2) + " ms\n";
+                txt += "decayTime: " + juce::String (refD.decayTime * 1000, 1) + " / " + juce::String (optD.decayTime * 1000, 1) + " ms\n";
+                txt += "totalDuration: " + juce::String (refD.totalDuration * 1000, 0) + " / " + juce::String (optD.totalDuration * 1000, 0) + " ms\n";
+                txt += "transientStr: " + juce::String (refD.transientStrength, 2) + " / " + juce::String (optD.transientStrength, 2) + "\n";
+                txt += "spectralCentroid: " + juce::String (refD.spectralCentroid, 0) + " / " + juce::String (optD.spectralCentroid, 0) + "\n";
+                txt += "spectralRolloff: " + juce::String (refD.spectralRolloff, 0) + " / " + juce::String (optD.spectralRolloff, 0) + "\n";
+                txt += "brightness: " + juce::String (refD.brightness, 4) + " / " + juce::String (optD.brightness, 4) + "\n";
+                txt += "HNR: " + juce::String (refD.harmonicNoiseRatio, 3) + " / " + juce::String (optD.harmonicNoiseRatio, 3) + "\n";
+                txt += "subEnergy: " + juce::String (refD.subEnergy, 3) + " / " + juce::String (optD.subEnergy, 3) + "\n";
+                txt += "lowMidEnergy: " + juce::String (refD.lowMidEnergy, 3) + " / " + juce::String (optD.lowMidEnergy, 3) + "\n";
+                txt += "midEnergy: " + juce::String (refD.midEnergy, 3) + " / " + juce::String (optD.midEnergy, 3) + "\n";
+                txt += "highEnergy: " + juce::String (refD.highEnergy, 4) + " / " + juce::String (optD.highEnergy, 4) + "\n";
+                txt += "rmsLoudness: " + juce::String (refD.rmsLoudness, 4) + " / " + juce::String (optD.rmsLoudness, 4) + "\n";
+
+                desktop.getChildFile ("match_autotest.txt").replaceWithText (txt);
+                DBG ("AUTOTEST: dist=" + juce::String (bestDist, 3) + " score=" + juce::String (bestScore) + "%");
+            }
+        }
     }
 
     bool hasEditor() const override               { return true; }

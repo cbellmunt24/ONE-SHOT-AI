@@ -240,7 +240,9 @@ static const char* getHTML()
             <div class="km-export-row">
                 <button class="km-btn-audio" id="kmExportAudio">Export Matched WAV</button>
                 <button class="km-btn-preset" id="kmExportPreset">Export Preset</button>
+                <button class="km-btn-preset" id="kmCopyReport">Copy Report</button>
             </div>
+            <div id="kmDiag" style="font-size:10px;color:var(--text2);margin-top:6px;font-family:monospace"></div>
         </div>
     </div>
 </div>
@@ -589,12 +591,23 @@ static const char* getJS2()
             kmMatchAudio = await ctx.decodeAudioData(ab.slice(0));
         }
 
-        // Score (distance → percentage)
+        // Score (distance → percentage) — steeper curve for honest perceptual grading
+        // dist < 1.5 = good (>75%), dist 1.5-4 = ok (30-75%), dist > 4 = poor (<30%)
         var dist = s.distance;
-        var score = Math.round(Math.max(0, 100 * Math.exp(-dist * 0.12)));
+        var score = Math.round(Math.max(0, 100 / (1 + dist * 0.8)));
         kmScoreValue.textContent = score + '%';
         kmScoreValue.className = 'km-score-value ' +
-            (score >= 70 ? 'good' : score >= 40 ? 'ok' : 'poor');
+            (score >= 75 ? 'good' : score >= 35 ? 'ok' : 'poor');
+        // Show buffer diagnostics
+        var diag = document.getElementById('kmDiag');
+        if (s.bufSamples) {
+            diag.textContent = 'Buffer: ' + s.bufSamples + ' samples, ' +
+                s.bufDurationMs + 'ms, SR=' + s.bufSR + ', peak=' + s.bufPeak + ', RMS=' + s.bufRMS;
+        }
+
+        // Store report for copy
+        window._kmLastReport = s;
+
         kmScoreSub.textContent = 'Distance: ' + dist.toFixed(4) +
             (s.converged ? ' (converged)' : '') +
             ' | ' + s.iteration + ' iterations';
@@ -724,6 +737,38 @@ static const char* getJS2()
             if (data.ok) alert('Preset saved: ' + data.path);
             else alert('Export failed');
         }
+    });
+
+    document.getElementById('kmCopyReport').addEventListener('click', function() {
+        var s = window._kmLastReport;
+        if (!s) { alert('No match result yet'); return; }
+        var rd = s.refDescriptors || {};
+        var md = s.matchedDescriptors || {};
+        var txt = '=== ONE-SHOT MATCH REPORT ===\n';
+        txt += 'Distance: ' + s.distance.toFixed(4) + '\n';
+        txt += 'Score: ' + Math.round(100 * Math.exp(-s.distance * 0.35)) + '%\n';
+        txt += 'Iterations: ' + s.iteration + '/' + s.maxIterations + '\n';
+        txt += 'Converged: ' + (s.converged ? 'yes' : 'no') + '\n';
+        if (s.bufSamples) txt += 'Buffer: ' + s.bufSamples + ' smp, ' + s.bufDurationMs + 'ms, SR=' + s.bufSR + ', peak=' + s.bufPeak + ', RMS=' + s.bufRMS + '\n';
+        txt += '\n--- DESCRIPTORS (ref / matched) ---\n';
+        var keys = ['fundamentalFreq','pitchStart','pitchDropSemitones','pitchDropTime',
+            'attackTime','decayTime','decayTime40','transientStrength','envelopeShape',
+            'spectralCentroid','spectralRolloff','brightness','harmonicNoiseRatio',
+            'subEnergy','lowMidEnergy','midEnergy','highEnergy','rmsLoudness','totalDuration',
+            'spectralTilt','spectralCrest','subHarmonicRatio','noiseSpectralCentroid'];
+        for (var i = 0; i < keys.length; i++) {
+            var k = keys[i];
+            var rv = (rd[k] !== undefined) ? Number(rd[k]).toFixed(4) : '?';
+            var mv = (md[k] !== undefined) ? Number(md[k]).toFixed(4) : '?';
+            txt += k + ': ' + rv + ' / ' + mv + '\n';
+        }
+        if (s.params) {
+            txt += '\n--- SYNTH PARAMS ---\n';
+            var pkeys = Object.keys(s.params);
+            for (var i = 0; i < pkeys.length; i++)
+                txt += pkeys[i] + ': ' + Number(s.params[pkeys[i]]).toFixed(4) + '\n';
+        }
+        navigator.clipboard.writeText(txt).then(function() { alert('Report copied to clipboard!'); });
     });
 
 })();
