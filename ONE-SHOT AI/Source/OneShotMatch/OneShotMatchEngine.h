@@ -6,7 +6,7 @@
 #include <functional>
 #include <map>
 #include "OneShotMatchDescriptors.h"
-#include "OneShotMatchSynth.h"
+#include "../UniversalSynth/UniversalSynth.h"
 #include "OneShotMatchOptimizer.h"
 
 // Top-level engine for the OneShotMatch system.
@@ -18,6 +18,18 @@
 
 namespace oneshotmatch
 {
+
+// Bridge types: map universal synth types into the oneshotmatch namespace
+#ifndef ONESHOTMATCH_TYPES_DEFINED
+#define ONESHOTMATCH_TYPES_DEFINED
+using MatchSynthParams = universalsynth::UniversalSynthParams;
+using WavetableData = universalsynth::WavetableData;
+using ResidualNoiseData = universalsynth::ResidualNoiseData;
+using TransientSampleData = universalsynth::TransientSampleData;
+using HarmonicPhaseData = universalsynth::HarmonicPhaseData;
+using SpectralEnvelopeData = universalsynth::SpectralEnvelopeData;
+using LearnedProfile = universalsynth::LearnedProfile;
+#endif
 
 enum class MatchState
 {
@@ -226,11 +238,6 @@ public:
             optimizer.setHarmonicPhases (&refHarmonicPhases);
             optimizer.setReferenceBuffer (&referenceBuffer);
 
-            // Build learned profile from match history (adaptive weights + bounds + extensions)
-            LearnedProfile learned = buildLearnedProfile (refDescriptors);
-            if (learned.valid)
-                optimizer.setLearnedProfile (&learned);
-
             auto progressCallback = [this] (int iter, float dist, int total) -> bool
             {
                 currentIteration.store (iter);
@@ -253,7 +260,6 @@ public:
                 bestGlobalSeed = globalSeeds[0];
                 seed = &bestGlobalSeed;
             }
-
             auto result = optimizer.optimize (refDescriptors, referenceSampleRate, progressCallback, seed);
 
             if (shouldCancel.load())
@@ -266,7 +272,7 @@ public:
             bestParams = result.bestParams;
 
             // Generate final matched one-shot (with side-channel data)
-            OneShotMatchSynth synth;
+            universalsynth::UniversalSynth synth;
             synth.setWavetable (&refWavetable);
             synth.setResidualNoise (&refResidual);
             synth.setTransientSample (&refTransient);
@@ -336,7 +342,7 @@ public:
 
         for (int i = 0; i < MatchSynthParams::NUM_PARAMS; ++i)
         {
-            json += "  \"" + juce::String (MatchSynthParams::getParamName (i)) + "\": ";
+            json += "  \"" + juce::String (MatchSynthParams::paramName (i)) + "\": ";
 
             if (i == 0) // oscType is int
                 json += juce::String ((int) arr[i]);
@@ -483,7 +489,7 @@ public:
         for (int i = 0; i < MatchSynthParams::NUM_PARAMS; ++i)
         {
             if (i > 0) j += ",";
-            j += "\"" + juce::String (MatchSynthParams::getParamName (i)) + "\":";
+            j += "\"" + juce::String (MatchSynthParams::paramName (i)) + "\":";
             if (i == 0) j += juce::String ((int) arr[i]);
             else j += juce::String (arr[i], 6);
         }
@@ -497,7 +503,7 @@ public:
         for (int i = 0; i < MatchSynthParams::NUM_PARAMS; ++i)
         {
             if (i > 0) j += ",";
-            j += "\"" + juce::String (MatchSynthParams::getParamName (i)) + "\":" +
+            j += "\"" + juce::String (MatchSynthParams::paramName (i)) + "\":" +
                  juce::String (bestResult.sensitivity[i], 3);
         }
         j += "}";
@@ -506,35 +512,14 @@ public:
 
     juce::String gapAnalysisToJSON () const
     {
-        auto& g = bestResult.gaps;
         juce::String j = "{";
-        j += "\"extensionsActivated\":" + juce::String (bestResult.extensionsActivated) + ",";
-        j += "\"phase1Iterations\":" + juce::String (bestResult.phase1Iterations) + ",";
+        j += "\"extensionsActivated\":0,";
+        j += "\"phase1Iterations\":" + juce::String (bestResult.cmaGenerations) + ",";
         j += "\"phase1Distance\":" + juce::String (bestResult.phase1Distance, 4) + ",";
-        // v1 extensions
-        j += "\"needsFM\":" + juce::String (g.needsFM ? "true" : "false") + ",";
-        j += "\"needsResonance\":" + juce::String (g.needsResonance ? "true" : "false") + ",";
-        j += "\"needsWobble\":" + juce::String (g.needsWobble ? "true" : "false") + ",";
-        j += "\"needsTransientSnap\":" + juce::String (g.needsTransientSnap ? "true" : "false") + ",";
-        j += "\"needsComb\":" + juce::String (g.needsComb ? "true" : "false") + ",";
-        j += "\"needsMultibandSat\":" + juce::String (g.needsMultibandSat ? "true" : "false") + ",";
-        j += "\"needsPhaseDistort\":" + juce::String (g.needsPhaseDistort ? "true" : "false") + ",";
-        // v2 extensions
-        j += "\"needsAdditive\":" + juce::String (g.needsAdditive ? "true" : "false") + ",";
-        j += "\"needsMultiReson\":" + juce::String (g.needsMultiReson ? "true" : "false") + ",";
-        j += "\"needsNoiseShape\":" + juce::String (g.needsNoiseShape ? "true" : "false") + ",";
-        j += "\"needsEQ\":" + juce::String (g.needsEQ ? "true" : "false") + ",";
-        j += "\"needsEnvComplex\":" + juce::String (g.needsEnvComplex ? "true" : "false") + ",";
-        j += "\"needsStereo\":" + juce::String (g.needsStereo ? "true" : "false") + ",";
-        // v3 extensions
-        j += "\"needsUnison\":" + juce::String (g.needsUnison ? "true" : "false") + ",";
-        j += "\"needsFormant\":" + juce::String (g.needsFormant ? "true" : "false") + ",";
-        j += "\"needsTransLayer\":" + juce::String (g.needsTransLayer ? "true" : "false") + ",";
-        j += "\"needsReverb\":" + juce::String (g.needsReverb ? "true" : "false") + ",";
-        j += "\"needsFilterSweep\":" + juce::String (g.needsFilterSweep ? "true" : "false") + ",";
-        j += "\"needsResidual\":" + juce::String (g.needsResidual ? "true" : "false") + ",";
-        j += "\"needsSpectralMatch\":" + juce::String (g.needsSpectralMatch ? "true" : "false") + ",";
-        j += "\"needsTransientCapture\":" + juce::String (g.needsTransientCapture ? "true" : "false") + ",";
+        j += "\"melLoss\":" + juce::String (bestResult.melLoss, 4) + ",";
+        j += "\"envCorrelation\":" + juce::String (bestResult.envCorrelation, 4) + ",";
+        j += "\"pitchContourLoss\":" + juce::String (bestResult.pitchContourLoss, 4) + ",";
+        j += "\"cmaGenerations\":" + juce::String (bestResult.cmaGenerations) + ",";
         j += "\"wavetableValid\":" + juce::String (refWavetable.valid ? "true" : "false");
         j += "}";
         return j;
@@ -573,9 +558,9 @@ private:
     juce::String lastError;
 
     // Settings
-    int   maxIterations  = 150;
-    float targetDistance  = 1.5f;
-    int   populationSize = 40;
+    int   maxIterations  = 1500;    // v3: CMA-ES generations (~5-8 min for 90%+ match)
+    float targetDistance  = 0.01f;  // mel loss scale: values ~0.1-2.0, converge only when very close
+    int   populationSize = 20;     // v3: CMA-ES lambda
 
     // Persistence
     juce::File matchDataDir;
@@ -925,16 +910,16 @@ private:
         auto addExt = [&](bool cond, const std::vector<int>& indices) {
             if (cond) for (int idx : indices) lp.preActivateExtensions.push_back (idx);
         };
-        addExt (fmCount > threshold,       {22, 23, 24});
-        addExt (resCount > threshold,      {25, 26});
-        addExt (addCount > threshold,      {39, 40, 41, 42, 43, 44, 88, 89, 90, 91});
-        addExt (formCount > threshold,     {67, 68, 69, 85});
-        addExt (sweepCount > threshold,    {80, 81, 82, 83});
-        addExt (residCount > threshold,    {86, 87});
-        addExt (specMatchCount > threshold, {92});
-        addExt (transCapCount > threshold, {94});
-        addExt (combCount > threshold,     {32, 33, 34});
-        addExt (pdCount > threshold,       {37, 38});
+        // New 88-param layout indices
+        addExt (fmCount > threshold,       {16, 17, 18});         // fmDepth, fmRatio, fmDecay
+        addExt (resCount > threshold,      {46, 48, 50, 51});     // modalLevel, numModes, modeSpread, modeRatioBase
+        addExt (addCount > threshold,      {19, 20, 21, 22, 23}); // additiveAmt, h2-h5
+        addExt (formCount > threshold,     {79, 80, 81});          // formantAmt, freq1, freq2
+        addExt (sweepCount > threshold,    {76, 77, 78});          // filterSweepAmt, start, end
+        addExt (residCount > threshold,    {40, 41});              // residualAmt, residualLevel
+        addExt (transCapCount > threshold, {64});                  // transientSampleAmt
+        addExt (combCount > threshold,     {46, 47, 53, 54});     // modalLevel, modalMode, ksFeedback, ksDamping
+        addExt (pdCount > threshold,       {28, 29});              // phaseDistort, phaseDistDecay
 
         // Find most popular oscType
         int bestOscVotes = 0;
@@ -971,7 +956,7 @@ private:
 
             for (int i = 0; i < MatchSynthParams::NUM_PARAMS; ++i)
             {
-                auto paramName = juce::String (MatchSynthParams::getParamName (i));
+                auto paramName = juce::String (MatchSynthParams::paramName (i));
                 auto searchStr = "\"" + paramName + "\":";
                 int pos = content.indexOf (searchStr);
                 if (pos >= 0)
@@ -1110,7 +1095,7 @@ private:
 
         for (int i = 0; i < MatchSynthParams::NUM_PARAMS; ++i)
         {
-            juce::String paramName = MatchSynthParams::getParamName (i);
+            juce::String paramName = MatchSynthParams::paramName (i);
             juce::String searchKey = "\"" + paramName + "\":";
 
             int pos = content.indexOf (searchKey);

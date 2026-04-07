@@ -631,6 +631,8 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
             json += ",\"refDescriptors\":" + engine.descriptorsToJSON (engine.getRefDescriptors());
             json += ",\"matchedDescriptors\":" + engine.descriptorsToJSON (engine.getMatchedDescriptors());
             json += ",\"converged\":" + juce::String (engine.getOptResult().converged ? "true" : "false");
+            json += ",\"descDistance\":" + juce::String (engine.getOptResult().descDistance, 4);
+            json += ",\"stftDistance\":" + juce::String (engine.getOptResult().stftDistance, 4);
             json += ",\"gapAnalysis\":" + engine.gapAnalysisToJSON();
 
             // Buffer diagnostics
@@ -746,11 +748,16 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
         juce::String txt;
         txt += "=== ONE-SHOT MATCH REPORT ===\n\n";
         txt += "Reference: " + eng.getReferenceFile().getFileName() + "\n";
-        txt += "Distance: " + juce::String (res.bestDistance, 4) + "\n";
-        txt += "Score: " + juce::String ((int) std::round (100.0f / (1.0f + res.bestDistance * 0.8f))) + "%\n";
+        txt += "Distance: " + juce::String (res.bestDistance, 4)
+            + " (desc=" + juce::String (res.descDistance, 2)
+            + " stft=" + juce::String (res.stftDistance, 2) + ")\n";
+        txt += "Score: " + juce::String ((int) std::round (100.0f * std::exp (-res.bestDistance * 2.0f))) + "%\n";
         txt += "Iterations: " + juce::String (res.iterations) + "\n";
         txt += "Converged: " + juce::String (res.converged ? "yes" : "no") + "\n";
-        txt += "Extensions: " + juce::String (res.extensionsActivated) + "\n\n";
+        txt += "CMA-ES Generations: " + juce::String (res.cmaGenerations)
+            + " | Mel Loss: " + juce::String (res.melLoss, 3)
+            + " | Env Corr: " + juce::String (res.envCorrelation, 3)
+            + " | Pitch Loss: " + juce::String (res.pitchContourLoss, 3) + "\n\n";
 
         txt += "--- DESCRIPTORS (ref vs matched) ---\n";
         txt += "fundamentalFreq: " + juce::String (refD.fundamentalFreq, 1) + " vs " + juce::String (matD.fundamentalFreq, 1) + " Hz\n";
@@ -777,7 +784,7 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
         {
             txt += juce::String (oneshotmatch::MatchSynthParams::getParamName (i)).paddedRight (' ', 22);
             txt += juce::String (arr[i], 4);
-            txt += " " + juce::String (oneshotmatch::MatchSynthParams::getParamUnit (i));
+            txt += " " + juce::String (universalsynth::UniversalSynthParams::getParamUnit (i));
             if (res.sensitivity[i] > 0.1f)
                 txt += "  [sens=" + juce::String (res.sensitivity[i], 2) + "]";
             txt += "\n";
@@ -803,14 +810,16 @@ class WebViewPluginAudioProcessorWrapper  : public WebViewPluginAudioProcessor
 public:
     WebViewPluginAudioProcessorWrapper()
     {
-        // === TEST: Genera .wav de prueba al arrancar ===
-        auto desktop = juce::File::getSpecialLocation (juce::File::userDesktopDirectory);
-        auto testDir = desktop.getChildFile ("ONE-SHOT AI Test Output");
-        int count = TestWavExporter::exportAll (testDir);
-        DBG ("ONE-SHOT AI: Exported " + juce::String (count) + " test wavs to Desktop");
+        // Startup tests disabled — uncomment to re-enable
+        // auto desktop = juce::File::getSpecialLocation (juce::File::userDesktopDirectory);
+        // auto testDir = desktop.getChildFile ("ONE-SHOT AI Test Output");
+        // int count = TestWavExporter::exportAll (testDir);
 
-        // === MANUAL PARAMS TEST — export both WAVs for comparison ===
-        {
+        (void) 0; // empty constructor body start
+
+        // Manual params test disabled
+        if (false) {
+            auto desktop = juce::File::getSpecialLocation (juce::File::userDesktopDirectory);
             juce::File kickFile ("C:\\Users\\charl\\Desktop\\ESMUC\\# SONOLOGIA ESMUC\\LABSO II\\ONE-SHOT AI\\Training\\libraries\\kicks\\trap\\kicks_trap_0027.wav");
             if (kickFile.existsAsFile() && matchEngine.loadReference (kickFile))
             {
@@ -859,9 +868,9 @@ public:
                 manual.compRelease = 0.02f;      // 20ms
                 // Limiter in synth handles peak flattening now — no need for masterSat
 
-                oneshotmatch::OneShotMatchSynth synth;
-                synth.setWavetable (&matchEngine.getRefWavetable());
-                auto manualBuf = synth.generate (manual, 44100.0);
+                universalsynth::UniversalSynth usynth;
+                usynth.setWavetable (&matchEngine.getRefWavetable());
+                auto manualBuf = usynth.generate (manual, 44100.0);
                 writeWavToFile (outputDir.getChildFile ("manual_match.wav"), manualBuf, 44100.0);
 
                 // Also run the optimizer
@@ -880,7 +889,7 @@ public:
                 auto& bestParams = matchEngine.getBestParams();
                 auto& bestBuffer = matchEngine.getMatchedBuffer();
                 float bestDist = matchEngine.getDistance();
-                int bestScore = (int) std::round (100.0f / (1.0f + bestDist * 0.8f));
+                int bestScore = (int) std::round (100.0f * std::exp (-bestDist * 2.0f));
 
                 // Export optimizer match WAV for comparison
                 if (bestBuffer.getNumSamples() > 0)

@@ -213,6 +213,40 @@ public:
         int pitchBodyStart = std::min (peakIdx + (int)(0.030f * sr), numSamples - 1);
         int pitchBodyEnd   = std::min (peakIdx + (int)(0.100f * sr), numSamples - 1);
         d.fundamentalFreq = estimateF0Autocorrelation (mono, pitchBodyStart, pitchBodyEnd, sr);
+
+        // === F0 sanity check: validate against spectral centroid ===
+        // If f0 is much higher than spectralCentroid, autocorrelation likely locked onto a harmonic.
+        // Also try a wider window for very low-frequency sounds.
+        {
+            // Quick spectral centroid from full signal for validation
+            int quickFFTOrder = 11;
+            int quickFFTSize = 1 << quickFFTOrder;
+            float quickCentroid = 0.0f;
+            if (numSamples >= quickFFTSize)
+            {
+                auto qSpec = computeSpectrum (mono, 0, quickFFTSize, sr, quickFFTOrder);
+                quickCentroid = qSpec.spectralCentroid;
+            }
+
+            // Try wider window (0 to end) for more reliable low-freq detection
+            float f0Wide = estimateF0Autocorrelation (mono, 0, std::min (numSamples, (int)(sr * 0.15f)), sr);
+
+            // If quick centroid is available and f0 seems wrong
+            if (quickCentroid > 10.0f && d.fundamentalFreq > quickCentroid * 3.0f)
+            {
+                // f0 is way higher than centroid — probably wrong
+                if (f0Wide > 10.0f && f0Wide < quickCentroid * 2.5f)
+                    d.fundamentalFreq = f0Wide;  // wider window gave better result
+                else
+                    d.fundamentalFreq = quickCentroid;  // use centroid as best guess
+            }
+
+            // If both windows disagree significantly, prefer the lower one
+            // (autocorrelation tends to find harmonics, not subharmonics)
+            if (f0Wide > 10.0f && d.fundamentalFreq > f0Wide * 1.8f)
+                d.fundamentalFreq = f0Wide;
+        }
+
         d.pitchEnd = d.fundamentalFreq;
 
         // Onset pitch: use zero-crossing rate in first 3ms for instantaneous frequency
@@ -284,8 +318,7 @@ public:
             d.spectralTilt = computeSpectralTilt (fullSpec.magnitudes, sr, fftSize);
         }
 
-        // === Per-region spectral analysis (skip in fast mode — 3 FFTs) ===
-        if (! fastMode)
+        // === Per-region spectral analysis (always computed — critical for distance function) ===
         {
             int regionFFTOrder = 9; // 512
             int regionFFTSize = 1 << regionFFTOrder;
@@ -319,9 +352,8 @@ public:
             d.spectralCrest = computeSpectralCrest (bodySpec.magnitudes);
         }
 
-        // === Spectrotemporal matrix (skip in fast mode — 8 FFTs) ===
-        if (! fastMode)
-            extractSpectroTemporal (mono, peakIdx, d.spectroTemporal, sr);
+        // === Spectrotemporal matrix (always computed — weight 8 in distance function) ===
+        extractSpectroTemporal (mono, peakIdx, d.spectroTemporal, sr);
 
         // === Micro transient (8 points in first 10ms after peak) ===
         extractMicroTransient (mono, peakIdx, d.microTransient, sr);
@@ -976,6 +1008,491 @@ private:
     }
 };
 
+// ==========================================================================
+// Mel Spectrogram Loss — PRIMARY loss function for spectral matching
+//
+// Multi-resolution mel spectrogram comparison: compares the ACTUAL audio
+// signals directly in perceptual frequency space. Far more accurate than
+// scalar descriptors for sound reconstruction.
+//
+// Loss = 0.7 * MelSpectrogramLoss + 0.15 * (1 - EnvelopeCorrelation) + 0.15 * PitchContourLoss
+// ==========================================================================
+
+class MelFilterbank
+{
+public:
+    MelFilterbank() = default;
+
+    void build (int fftSz, float sr, int nBands = 128)
+    {
+        fftSize = fftSz;
+        sampleRate = sr;
+        numBands = nBands;
+        int numBins = fftSize / 2;
+
+        // Mel edges: numBands + 2 points from 20 Hz to Nyquist
+        float melLow = hzToMel (20.0f);
+        float melHigh = hzToMel (std::min (20000.0f, sr * 0.49f));
+        std::vector<float> melEdges (numBands + 2);
+        for (int i = 0; i < numBands + 2; ++i)
+            melEdges[i] = melToHz (melLow + (float) i / (float)(numBands + 1) * (melHigh - melLow));
+
+        // Build sparse triangular filters
+        filters.resize (numBands);
+        for (int m = 0; m < numBands; ++m)
+        {
+            filters[m].clear();
+            float fLow  = melEdges[m];
+            float fMid  = melEdges[m + 1];
+            float fHigh = melEdges[m + 2];
+
+            int binLow  = std::max (0, (int) std::floor (fLow  / sr * (float) fftSize));
+            int binHigh = std::min (numBins - 1, (int) std::ceil (fHigh / sr * (float) fftSize));
+
+            for (int b = binLow; b <= binHigh; ++b)
+            {
+                float freq = (float) b * sr / (float) fftSize;
+                float weight = 0.0f;
+                if (freq >= fLow && freq <= fMid && fMid > fLow)
+                    weight = (freq - fLow) / (fMid - fLow);
+                else if (freq > fMid && freq <= fHigh && fHigh > fMid)
+                    weight = (fHigh - freq) / (fHigh - fMid);
+                if (weight > 1e-6f)
+                    filters[m].push_back ({b, weight});
+            }
+        }
+        built = true;
+    }
+
+    void apply (const float* magnitudes, int numBins, float* melBands) const
+    {
+        for (int m = 0; m < numBands; ++m)
+        {
+            float sum = 0.0f;
+            for (const auto& [bin, weight] : filters[m])
+            {
+                if (bin < numBins)
+                    sum += magnitudes[bin] * magnitudes[bin] * weight;
+            }
+            melBands[m] = sum;
+        }
+    }
+
+    bool isBuilt() const { return built; }
+    int getNumBands() const { return numBands; }
+
+private:
+    static float hzToMel (float hz) { return 2595.0f * std::log10 (1.0f + hz / 700.0f); }
+    static float melToHz (float mel) { return 700.0f * (std::pow (10.0f, mel / 2595.0f) - 1.0f); }
+
+    int fftSize = 0;
+    float sampleRate = 0.0f;
+    int numBands = 128;
+    bool built = false;
+    std::vector<std::vector<std::pair<int, float>>> filters; // [band][{bin, weight}]
+};
+
+// Compute log-mel spectrogram from mono audio
+// Returns vector of frames, each is numMelBands log-energy values
+inline std::vector<std::vector<float>> computeMelSpectrogram (
+    const std::vector<float>& mono, float sampleRate,
+    int fftSize, int hopSize, const MelFilterbank& fb)
+{
+    const int numBands = fb.getNumBands();
+    const int numSamples = (int) mono.size();
+    const int numFrames = std::min (64, std::max (1, (numSamples - fftSize) / hopSize + 1));
+
+    juce::dsp::FFT fft ((int) std::round (std::log2 ((double) fftSize)));
+
+    std::vector<std::vector<float>> result;
+    result.reserve (numFrames);
+
+    std::vector<float> fftData (fftSize * 2, 0.0f);
+    std::vector<float> magnitudes (fftSize / 2, 0.0f);
+    std::vector<float> melBands (numBands, 0.0f);
+
+    for (int frame = 0; frame < numFrames; ++frame)
+    {
+        int start = frame * hopSize;
+        if (start + fftSize > numSamples) break;
+
+        // Windowed FFT (Hann)
+        for (int i = 0; i < fftSize; ++i)
+        {
+            float win = 0.5f * (1.0f - std::cos (2.0f * 3.14159265358979f * (float) i / (float) fftSize));
+            fftData[i] = mono[start + i] * win;
+        }
+        std::fill (fftData.begin() + fftSize, fftData.end(), 0.0f);
+
+        fft.performRealOnlyForwardTransform (fftData.data());
+
+        int numBins = fftSize / 2;
+        for (int b = 0; b < numBins; ++b)
+        {
+            float re = fftData[b * 2];
+            float im = fftData[b * 2 + 1];
+            magnitudes[b] = std::sqrt (re * re + im * im);
+        }
+
+        // Apply mel filterbank
+        fb.apply (magnitudes.data(), numBins, melBands.data());
+
+        // Log scale
+        std::vector<float> logMel (numBands);
+        for (int m = 0; m < numBands; ++m)
+            logMel[m] = std::log (std::max (1e-7f, melBands[m]));
+
+        result.push_back (std::move (logMel));
+    }
+
+    return result;
+}
+
+// Multi-resolution mel spectrogram loss
+// Compares ref and gen audio using Spectral Convergence + Log Magnitude distance
+// CRITICAL: Pads shorter signal with zeros so duration mismatch is penalized
+inline float computeMelSpectrogramLoss (const std::vector<float>& refMono,
+                                         const std::vector<float>& genMono,
+                                         float sampleRate)
+{
+    if (refMono.empty() || genMono.empty()) return 100.0f;
+
+    // Pad shorter signal to match longer — silence where audio should exist gets penalized
+    int maxLen = std::max ((int) refMono.size(), (int) genMono.size());
+    std::vector<float> refPad = refMono;
+    std::vector<float> genPad = genMono;
+    refPad.resize (maxLen, 0.0f);
+    genPad.resize (maxLen, 0.0f);
+
+    // NO loudness normalization here — RMS loss handles volume separately
+    // Normalization was masking spectral shape differences
+
+    static constexpr int NUM_RES = 3;
+    static constexpr int fftSizes[NUM_RES] = { 512, 1024, 2048 };
+    static constexpr float resWeights[NUM_RES] = { 0.25f, 0.5f, 0.25f };
+
+    // Thread-local mel filterbanks (built once per FFT size + sample rate)
+    thread_local MelFilterbank filterbanks[NUM_RES];
+    thread_local float cachedSR = 0.0f;
+
+    if (cachedSR != sampleRate)
+    {
+        for (int r = 0; r < NUM_RES; ++r)
+            filterbanks[r].build (fftSizes[r], sampleRate, 128);
+        cachedSR = sampleRate;
+    }
+
+    float totalLoss = 0.0f;
+
+    for (int r = 0; r < NUM_RES; ++r)
+    {
+        int fftSize = fftSizes[r];
+        int hopSize = fftSize / 4;
+        if (maxLen < fftSize) continue;
+
+        auto refMel = computeMelSpectrogram (refPad, sampleRate, fftSize, hopSize, filterbanks[r]);
+        auto genMel = computeMelSpectrogram (genPad, sampleRate, fftSize, hopSize, filterbanks[r]);
+
+        // Use ALL frames from the reference (padded gen will have silence frames)
+        int numFrames = std::max ((int) refMel.size(), (int) genMel.size());
+        if (numFrames == 0) continue;
+        int numBands = filterbanks[r].getNumBands();
+
+        // Create silence frame for missing frames
+        std::vector<float> silenceFrame (numBands, std::log (1e-7f));
+
+        float diffNorm = 0.0f, refNorm = 0.0f;
+        float logMagSum = 0.0f;
+        int totalBins = 0;
+
+        for (int f = 0; f < numFrames; ++f)
+        {
+            const auto& rv = (f < (int) refMel.size()) ? refMel[f] : silenceFrame;
+            const auto& gv = (f < (int) genMel.size()) ? genMel[f] : silenceFrame;
+
+            for (int b = 0; b < numBands; ++b)
+            {
+                float diff = rv[b] - gv[b];
+                diffNorm += diff * diff;
+                refNorm += rv[b] * rv[b];
+                logMagSum += std::abs (diff);
+                ++totalBins;
+            }
+        }
+
+        float sc = (refNorm > 1e-10f) ? std::sqrt (diffNorm / refNorm) : std::sqrt (diffNorm);
+        float lm = (totalBins > 0) ? logMagSum / (float) totalBins : 0.0f;
+
+        totalLoss += resWeights[r] * (sc + lm);
+    }
+
+    return totalLoss;
+}
+
+// Envelope correlation: Pearson correlation of RMS envelopes at ~1ms resolution
+// Uses the REFERENCE length — if gen is shorter, missing frames are treated as silence (0)
+inline float computeEnvelopeCorrelation (const std::vector<float>& refMono,
+                                          const std::vector<float>& genMono,
+                                          float sampleRate)
+{
+    int hopSamples = std::max (1, (int)(sampleRate * 0.001f)); // 1ms
+    // Use reference length as the frame count (gen treated as 0 beyond its end)
+    int numFrames = (int) refMono.size() / hopSamples;
+    if (numFrames < 4) return 0.0f;
+
+    std::vector<float> refEnv (numFrames), genEnv (numFrames);
+
+    for (int f = 0; f < numFrames; ++f)
+    {
+        int start = f * hopSamples;
+        float refSq = 0.0f, genSq = 0.0f;
+        for (int i = 0; i < hopSamples; ++i)
+        {
+            int idx = start + i;
+            float rv = (idx < (int) refMono.size()) ? refMono[idx] : 0.0f;
+            float gv = (idx < (int) genMono.size()) ? genMono[idx] : 0.0f;
+            refSq += rv * rv;
+            genSq += gv * gv;
+        }
+        refEnv[f] = std::sqrt (refSq / (float) hopSamples);
+        genEnv[f] = std::sqrt (genSq / (float) hopSamples);
+    }
+
+    // Pearson correlation
+    float meanR = 0.0f, meanG = 0.0f;
+    for (int f = 0; f < numFrames; ++f) { meanR += refEnv[f]; meanG += genEnv[f]; }
+    meanR /= (float) numFrames;
+    meanG /= (float) numFrames;
+
+    float cov = 0.0f, varR = 0.0f, varG = 0.0f;
+    for (int f = 0; f < numFrames; ++f)
+    {
+        float dr = refEnv[f] - meanR;
+        float dg = genEnv[f] - meanG;
+        cov += dr * dg;
+        varR += dr * dr;
+        varG += dg * dg;
+    }
+
+    float denom = std::sqrt (varR * varG);
+    return (denom > 1e-10f) ? std::max (0.0f, cov / denom) : 0.0f;
+}
+
+// Pitch contour loss: frame-by-frame f0 comparison (only for tonal sounds)
+inline float computePitchContourLoss (const std::vector<float>& refMono,
+                                       const std::vector<float>& genMono,
+                                       float sampleRate, float hnr)
+{
+    if (hnr < 0.5f) return 0.0f; // not applicable for noisy sounds
+
+    int frameSamples = (int)(sampleRate * 0.010f); // 10ms frames
+    int numFrames = std::max (0, (int) refMono.size() / frameSamples - 1);
+    numFrames = std::min (numFrames, 20); // cap at 200ms
+    if (numFrames < 2) return 0.0f;
+
+    // Simple autocorrelation f0 per frame
+    auto estimateFrameF0 = [&](const std::vector<float>& mono, int frameStart, int frameLen, float sr) -> float
+    {
+        int minLag = (int)(sr / 500.0f);  // up to 500 Hz
+        int maxLag = std::min (frameLen / 2, (int)(sr / 20.0f)); // down to 20 Hz
+        if (maxLag <= minLag) return 0.0f;
+
+        float bestCorr = -1.0f;
+        int bestLag = minLag;
+
+        for (int lag = minLag; lag <= maxLag; ++lag)
+        {
+            float corr = 0.0f, n1 = 0.0f, n2 = 0.0f;
+            int corrLen = frameLen - lag;
+            for (int i = 0; i < corrLen; ++i)
+            {
+                float a = mono[frameStart + i];
+                float b = mono[frameStart + i + lag];
+                corr += a * b;
+                n1 += a * a;
+                n2 += b * b;
+            }
+            float d = std::sqrt (n1 * n2);
+            if (d > 0.0f)
+            {
+                float norm = corr / d;
+                if (norm > bestCorr) { bestCorr = norm; bestLag = lag; }
+            }
+        }
+
+        return (bestCorr > 0.3f) ? sr / (float) bestLag : 0.0f;
+    };
+
+    float totalError = 0.0f;
+    int voicedFrames = 0;
+
+    for (int f = 0; f < numFrames; ++f)
+    {
+        int start = f * frameSamples;
+        float refF0 = estimateFrameF0 (refMono, start, frameSamples, sampleRate);
+        // If gen is shorter than this frame, treat as unvoiced (penalty if ref is voiced)
+        float genF0 = (start + frameSamples <= (int) genMono.size())
+            ? estimateFrameF0 (genMono, start, frameSamples, sampleRate) : 0.0f;
+
+        if (refF0 > 20.0f)
+        {
+            ++voicedFrames;
+            if (genF0 > 20.0f)
+            {
+                float semitoneError = std::abs (12.0f * std::log2 (refF0 / genF0));
+                totalError += std::min (12.0f, semitoneError);
+            }
+            else
+            {
+                totalError += 12.0f; // gen has no pitch where ref does = max penalty
+            }
+        }
+    }
+
+    if (voicedFrames == 0) return 0.0f;
+    float meanError = totalError / (float) voicedFrames;
+    return std::min (1.0f, meanError / 6.0f); // normalize: 6 semitones = 1.0
+}
+
+// RMS loudness match — penalizes wrong output level AND wrong duration
+// Uses REFERENCE length: gen samples beyond gen length treated as 0
+inline float computeRMSLoss (const std::vector<float>& refMono,
+                              const std::vector<float>& genMono)
+{
+    int refLen = (int) refMono.size();
+    if (refLen < 1) return 10.0f;
+
+    // Compute RMS over full reference length (gen padded with zeros implicitly)
+    float refSq = 0.0f, genSq = 0.0f;
+    for (int i = 0; i < refLen; ++i)
+    {
+        refSq += refMono[i] * refMono[i];
+        float gv = (i < (int) genMono.size()) ? genMono[i] : 0.0f;
+        genSq += gv * gv;
+    }
+    float refRMS = std::sqrt (refSq / (float) refLen);
+    float genRMS = std::sqrt (genSq / (float) refLen);
+
+    if (refRMS < 1e-6f) return 0.0f;
+
+    float ratio = genRMS / refRMS;
+    if (ratio < 0.01f) return 10.0f;
+    return std::min (5.0f, std::abs (std::log (std::max (0.01f, ratio))));
+}
+
+// Multi-resolution LINEAR STFT loss — raw frequency bins, critical for bass/kick accuracy
+// At 2048 FFT each bin = 21.5 Hz — can distinguish 60 Hz from 80 Hz kicks
+// Pads shorter signal with zeros (same as mel loss)
+inline float computeLinearSTFTLoss (const std::vector<float>& refMono,
+                                     const std::vector<float>& genMono,
+                                     float sampleRate)
+{
+    if (refMono.empty() || genMono.empty()) return 100.0f;
+
+    int maxLen = std::max ((int) refMono.size(), (int) genMono.size());
+    std::vector<float> refPad = refMono;
+    std::vector<float> genPad = genMono;
+    refPad.resize (maxLen, 0.0f);
+    genPad.resize (maxLen, 0.0f);
+
+    // NO loudness normalization — RMS loss handles that separately
+    // This way spectral SHAPE differences are preserved
+
+    static constexpr int NUM_RES = 3;
+    static constexpr int fftOrders[NUM_RES] = { 9, 10, 11 }; // 512, 1024, 2048
+    static constexpr float resWeights[NUM_RES] = { 0.2f, 0.4f, 0.4f }; // emphasize 1024+2048 for bass
+
+    float totalLoss = 0.0f;
+
+    for (int r = 0; r < NUM_RES; ++r)
+    {
+        int fftSize = 1 << fftOrders[r];
+        int hopSize = fftSize / 4;
+        int numBins = fftSize / 2;
+
+        if (maxLen < fftSize) continue;
+
+        juce::dsp::FFT fft (fftOrders[r]);
+
+        int numFrames = std::max (1, (maxLen - fftSize) / hopSize + 1);
+        numFrames = std::min (numFrames, 32); // more frames than before for better coverage
+
+        float scDiffSq = 0.0f, scRefSq = 0.0f;
+        float logMagSum = 0.0f;
+        int totalBins = 0;
+
+        std::vector<float> refFFT (fftSize * 2, 0.0f);
+        std::vector<float> genFFT (fftSize * 2, 0.0f);
+
+        for (int frame = 0; frame < numFrames; ++frame)
+        {
+            int start = frame * hopSize;
+            if (start + fftSize > maxLen) break;
+
+            for (int i = 0; i < fftSize; ++i)
+            {
+                float win = 0.5f * (1.0f - std::cos (2.0f * 3.14159265358979f * (float) i / (float) fftSize));
+                refFFT[i] = refPad[start + i] * win;
+                genFFT[i] = genPad[start + i] * win;
+            }
+            std::fill (refFFT.begin() + fftSize, refFFT.end(), 0.0f);
+            std::fill (genFFT.begin() + fftSize, genFFT.end(), 0.0f);
+
+            fft.performRealOnlyForwardTransform (refFFT.data());
+            fft.performRealOnlyForwardTransform (genFFT.data());
+
+            for (int b = 1; b < numBins; ++b)
+            {
+                float refMag = std::sqrt (refFFT[b * 2] * refFFT[b * 2] + refFFT[b * 2 + 1] * refFFT[b * 2 + 1]);
+                float genMag = std::sqrt (genFFT[b * 2] * genFFT[b * 2] + genFFT[b * 2 + 1] * genFFT[b * 2 + 1]);
+
+                float refLog = std::log (std::max (1e-7f, refMag));
+                float genLog = std::log (std::max (1e-7f, genMag));
+
+                float diff = refLog - genLog;
+                scDiffSq += diff * diff;
+                scRefSq += refLog * refLog;
+                logMagSum += std::abs (diff);
+                ++totalBins;
+            }
+        }
+
+        float sc = (scRefSq > 1e-10f) ? std::sqrt (scDiffSq / scRefSq) : std::sqrt (scDiffSq);
+        float lm = (totalBins > 0) ? logMagSum / (float) totalBins : 0.0f;
+
+        totalLoss += resWeights[r] * (sc + lm);
+    }
+
+    return totalLoss;
+}
+
+// Composite spectral match loss — combines linear STFT + mel + envelope + pitch + RMS
+inline float computeSpectralMatchLoss (const std::vector<float>& refMono,
+                                        const std::vector<float>& genMono,
+                                        float sampleRate, float hnr)
+{
+    // Linear STFT: critical for bass/kick — high frequency resolution at low freqs
+    float stftLoss = computeLinearSTFTLoss (refMono, genMono, sampleRate);
+
+    // Mel spectrogram: good for mid/high frequency timbre
+    float melLoss = computeMelSpectrogramLoss (refMono, genMono, sampleRate);
+
+    // Envelope: time-domain amplitude shape matching
+    float envCorr = computeEnvelopeCorrelation (refMono, genMono, sampleRate);
+
+    // Pitch contour: fundamental frequency tracking
+    float pitchLoss = computePitchContourLoss (refMono, genMono, sampleRate, hnr);
+
+    // RMS: overall loudness match
+    float rmsLoss = computeRMSLoss (refMono, genMono);
+
+    return 0.35f * stftLoss          // linear STFT — bass/kick accuracy
+         + 0.20f * melLoss           // mel spectrogram — mid/high timbre
+         + 0.20f * (1.0f - envCorr)  // envelope shape
+         + 0.10f * pitchLoss         // pitch accuracy
+         + 0.15f * rmsLoss;          // loudness
+}
+
 // ========== Distance computation ==========
 // Weighted multi-region distance between descriptor sets.
 // Includes spectrotemporal comparison for precise time-varying spectral matching.
@@ -1030,6 +1547,11 @@ inline float computeDistance (const MatchDescriptors& ref, const MatchDescriptor
     float bandWeight[NUM_SPECTRAL_BANDS];
     for (int i = 0; i < NUM_SPECTRAL_BANDS; ++i)
         bandWeight[i] = 0.3f + 0.7f * aWeightBand (i, NUM_SPECTRAL_BANDS); // blend: 30% flat + 70% A-weighted
+
+    // === Loudness matching (weight: ~4) — guides optimizer toward correct level ===
+    // Using both linear RMS and log-scale (dB) for better gradient at all levels
+    dist += 2.5f * w.envelope * nsd (ref.rmsLoudness, gen.rmsLoudness, std::max (0.05f, ref.rmsLoudness * 0.3f));
+    dist += 1.5f * w.envelope * nsd (ref.lufs, gen.lufs, 6.0f);  // 6 dB scale
 
     // === Duration penalty — prevents optimizer from making sound too long/short ===
     dist += 3.0f * w.envelope * nsd (ref.totalDuration, gen.totalDuration, std::max (0.05f, ref.totalDuration * 0.3f));
@@ -1297,47 +1819,88 @@ struct GapAnalysis
     }
 
     // Returns param indices that should be activated for optimization
+    // Mapped to UniversalSynthParams 88-param layout:
+    //   0-5: Global, 6-13: Pitch, 14-31: Tonal, 32-45: Noise,
+    //   46-57: Modal/KS, 58-65: Transient, 66-73: Envelope,
+    //   74-81: Filter, 82-87: Effects
     std::vector<int> getExtensionIndices() const
     {
         std::vector<int> indices;
-        // v1
-        if (needsFM)            { indices.push_back (22); indices.push_back (23); indices.push_back (24); }
-        if (needsResonance)     { indices.push_back (25); indices.push_back (26); }
-        if (needsWobble)        { indices.push_back (27); indices.push_back (28); indices.push_back (29); }
-        if (needsTransientSnap) { indices.push_back (30); indices.push_back (31); }
-        if (needsComb)          { indices.push_back (32); indices.push_back (33); indices.push_back (34); }
-        if (needsMultibandSat)  { indices.push_back (35); indices.push_back (36); }
-        if (needsPhaseDistort)  { indices.push_back (37); indices.push_back (38); }
-        // v2
-        if (needsAdditive)      { for (int i = 39; i <= 44; ++i) indices.push_back (i); }
-        if (needsMultiReson)    { for (int i = 45; i <= 48; ++i) indices.push_back (i); }
-        if (needsNoiseShape)    { for (int i = 49; i <= 52; ++i) indices.push_back (i); }
-        if (needsEQ)            { for (int i = 53; i <= 57; ++i) indices.push_back (i); }
-        if (needsEnvComplex)    { for (int i = 58; i <= 61; ++i) indices.push_back (i); }
-        if (needsStereo)        { for (int i = 62; i <= 63; ++i) indices.push_back (i); }
-        // v3
-        if (needsUnison)        { indices.push_back (64); indices.push_back (65); indices.push_back (66); }
-        if (needsFormant)       { indices.push_back (67); indices.push_back (68); indices.push_back (69); }
-        if (needsTransLayer)    { indices.push_back (70); indices.push_back (71); indices.push_back (72); }
-        if (needsReverb)        { indices.push_back (73); indices.push_back (74); indices.push_back (75); }
-        // v4
-        if (needsMixControl)    { for (int i = 76; i <= 79; ++i) indices.push_back (i); }
-        if (needsFilterSweep)   { for (int i = 80; i <= 83; ++i) indices.push_back (i); }
-        if (needsSubPitch)      { indices.push_back (84); }
-        if (needsFormant)       { indices.push_back (85); } // formantQ activated with formant
-        // v5
-        if (needsResidual)          { indices.push_back (86); indices.push_back (87); }
-        if (needsAdditive)          { for (int i = 88; i <= 91; ++i) indices.push_back (i); } // h5-h8 with additive
-        if (needsSpectralMatch)     { indices.push_back (92); }
-        // subWavetable (93) activated when wavetable is available (handled by optimizer)
-        if (needsTransientCapture)  { indices.push_back (94); }
-        // v6
-        if (needsPitchBounce)  { indices.push_back (95); indices.push_back (96); }
-        if (needsClickType)    { indices.push_back (97); }
-        if (needsMasterSat)    { indices.push_back (98); indices.push_back (99); }
-        if (needsSubPhase)     { indices.push_back (100); }
-        if (needsCompressor)   { for (int i = 101; i <= 104; ++i) indices.push_back (i); }
-        if (needsSubCrossover) { indices.push_back (105); }
+        // FM synthesis (Layer A)
+        if (needsFM)            { indices.push_back (16); indices.push_back (17); indices.push_back (18); } // fmDepth, fmRatio, fmDecay
+        // Modal resonance (Layer C) — replaces old bodyResonance + comb
+        if (needsResonance || needsComb) {
+            indices.push_back (46); indices.push_back (47); // modalLevel, modalMode
+            indices.push_back (48); indices.push_back (49); // numModes, modeDecay
+            indices.push_back (50); indices.push_back (51); // modeSpread, modeRatioBase
+            indices.push_back (52);                         // modeDamping
+        }
+        // Wobble
+        if (needsWobble)        { indices.push_back (12); indices.push_back (13); } // pitchWobble, wobbleRate
+        // Transient snap (Layer D)
+        if (needsTransientSnap) { indices.push_back (58); indices.push_back (63); } // transientLevel, snapAmount
+        // Saturation (replaces multibandSat)
+        if (needsMultibandSat || needsMasterSat)  { indices.push_back (85); indices.push_back (86); } // satAmount, satType
+        // Phase distortion (Layer A)
+        if (needsPhaseDistort)  { indices.push_back (28); indices.push_back (29); } // phaseDistort, phaseDistDecay
+        // Additive harmonics (Layer A)
+        if (needsAdditive)      { indices.push_back (19); indices.push_back (20); indices.push_back (21);
+                                  indices.push_back (22); indices.push_back (23); indices.push_back (24); } // additiveAmt, h2-h5, inharmonicity
+        // Multi-resonance → more modal modes
+        if (needsMultiReson)    { indices.push_back (46); indices.push_back (48); indices.push_back (50); indices.push_back (51); }
+        // Noise shaping (Layer B)
+        if (needsNoiseShape)    { indices.push_back (32); indices.push_back (33); indices.push_back (34);
+                                  indices.push_back (35); indices.push_back (42); } // noiseLevel, color, filterFreq, Q, HP
+        // Complex envelope
+        if (needsEnvComplex)    { indices.push_back (70); indices.push_back (71);
+                                  indices.push_back (72); indices.push_back (73); } // sustain, sustainTime, release, curve
+        // Stereo
+        if (needsStereo)        { indices.push_back (4); indices.push_back (43); } // stereoWidth, noiseStereo
+        // Unison (Layer A)
+        if (needsUnison)        { indices.push_back (25); indices.push_back (26); indices.push_back (27); } // unisonVoices, detune, drift
+        // Formant (Filter Chain)
+        if (needsFormant)       { indices.push_back (79); indices.push_back (80); indices.push_back (81); } // formantAmt, freq1, freq2
+        // Transient layer (Layer D)
+        if (needsTransLayer)    { indices.push_back (58); indices.push_back (59);
+                                  indices.push_back (60); indices.push_back (61); } // transientLevel, clickType, clickFreq, clickDecay
+        // Reverb (Effects)
+        if (needsReverb)        { indices.push_back (82); indices.push_back (83); } // reverbAmt, reverbDecay
+        // Layer gates (always active)
+        if (needsMixControl)    { indices.push_back (14); indices.push_back (32);
+                                  indices.push_back (46); indices.push_back (58); } // tonalLevel, noiseLevel, modalLevel, transientLevel
+        // Filter sweep
+        if (needsFilterSweep)   { indices.push_back (76); indices.push_back (77); indices.push_back (78); } // sweepAmt, start, end
+        // Sub pitch
+        if (needsSubPitch)      { indices.push_back (31); } // subDetune
+        // Residual noise (Layer B)
+        if (needsResidual)      { indices.push_back (40); indices.push_back (41); } // residualAmt, residualLevel
+        // Transient capture (Layer D)
+        if (needsTransientCapture) { indices.push_back (64); } // transientSampleAmt
+        // Pitch bounce
+        if (needsPitchBounce)   { indices.push_back (11); } // pitchBounce
+        // Click type
+        if (needsClickType)     { indices.push_back (59); } // clickType
+        // Compressor
+        if (needsCompressor)    { indices.push_back (87); } // compAmount
+        // Karplus-Strong (when comb+resonance both needed)
+        if (needsComb && needsResonance) {
+            indices.push_back (53); indices.push_back (54); // ksFeedback, ksDamping
+            indices.push_back (55); indices.push_back (56); // ksBrightness, ksPickPosition
+            indices.push_back (57);                         // ksBodyResonance
+        }
+        // Noise bursts (for clap-like sounds)
+        if (needsNoiseShape && needsTransientSnap) {
+            indices.push_back (37); indices.push_back (38); // burstCount, burstSpacing
+        }
+        // Granular (for textures)
+        if (needsNoiseShape && needsStereo) {
+            indices.push_back (45); indices.push_back (44); // granularDensity, noiseEvolution
+        }
+        // Chorus
+        if (needsStereo || needsUnison) { indices.push_back (84); } // chorusAmt
+        // Remove duplicates
+        std::sort (indices.begin(), indices.end());
+        indices.erase (std::unique (indices.begin(), indices.end()), indices.end());
         return indices;
     }
 };

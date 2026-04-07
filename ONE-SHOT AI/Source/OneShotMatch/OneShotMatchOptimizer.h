@@ -9,21 +9,36 @@
 #include <cmath>
 #include <numeric>
 #include "OneShotMatchDescriptors.h"
-#include "OneShotMatchSynth.h"
+#include "../UniversalSynth/UniversalSynth.h"
+#include "../UniversalSynth/UniversalGenreRules.h"
 
-// Self-improving optimizer for the OneShotMatch system.
+// ==========================================================================
+// OneShotMatchOptimizer v3 — Spectral Matching Architecture
 //
-// Five-phase adaptive strategy:
-//   1. DE/best/1/bin on CORE params only (22 params) — fast global search  [50% budget]
-//   2. Gap analysis #1 → activate extensions
-//   3. DE on CORE + activated extensions                                   [30% budget]
-//   4. Gap analysis #2 → re-analyze best, activate MORE extensions if needed
-//   5. DE on all active params                                             [20% budget]
-//   6. Sensitivity analysis + Nelder-Mead refinement on sensitive params   [120 evals]
-//
-// The optimizer automatically discovers which synth extensions are needed
-// and only activates them when the core params can't match specific aspects
-// of the reference sound.
+// Key changes from v2:
+//   - PRIMARY loss: Multi-resolution Mel Spectrogram (not descriptors)
+//   - Optimizer: CMA-ES (not DE) — searches ALL 88 params
+//   - No classifier dependency for search space
+//   - No locked params — all 88 are optimizable with smart initialization
+//   - Descriptors used ONLY for initialization + UI display
+//   - Composite loss: 0.7*Mel + 0.15*Envelope + 0.15*PitchContour
+// ==========================================================================
+
+namespace oneshotmatch
+{
+
+#ifndef ONESHOTMATCH_TYPES_DEFINED
+#define ONESHOTMATCH_TYPES_DEFINED
+using MatchSynthParams = universalsynth::UniversalSynthParams;
+using WavetableData = universalsynth::WavetableData;
+using ResidualNoiseData = universalsynth::ResidualNoiseData;
+using TransientSampleData = universalsynth::TransientSampleData;
+using HarmonicPhaseData = universalsynth::HarmonicPhaseData;
+using SpectralEnvelopeData = universalsynth::SpectralEnvelopeData;
+using LearnedProfile = universalsynth::LearnedProfile;
+#endif
+
+} // close temporarily to keep the rest of file unchanged
 
 namespace oneshotmatch
 {
@@ -32,853 +47,857 @@ struct OptimizationResult
 {
     MatchSynthParams bestParams;
     float            bestDistance        = 999.0f;
+    float            descDistance        = 999.0f;
+    float            stftDistance        = 999.0f;
     int              iterations         = 0;
     bool             converged          = false;
 
-    // Per-parameter sensitivity (0..1)
     std::array<float, MatchSynthParams::NUM_PARAMS> sensitivity = {};
 
-    // Merged gap analysis from both passes
+    // Legacy compat (kept for UI)
     GapAnalysis gaps;
     int         extensionsActivated = 0;
     int         phase1Iterations    = 0;
     float       phase1Distance      = 999.0f;
+
+    // New spectral match metrics
+    float       melLoss             = 999.0f;
+    float       envCorrelation      = 0.0f;
+    float       pitchContourLoss    = 999.0f;
+    int         cmaGenerations      = 0;
 };
 
 using ProgressCallback = std::function<bool (int, float, int)>;
 
+// ==========================================================================
+// Instrument type classifier — kept for UI display and initialization hints
+// ==========================================================================
+enum class InstrumentType { Kick, Snare, HiHat, Clap, Perc, Bass, Lead, Pad, Texture, Unknown };
+
+inline InstrumentType classifyInstrument (const MatchDescriptors& d)
+{
+    float f0 = d.fundamentalFreq;
+    float dur = d.totalDuration;
+    float hnr = d.harmonicNoiseRatio;
+    float bright = d.brightness;
+    float sub = d.subEnergy;
+    float high = d.highEnergy;
+    float mid = d.midEnergy;
+    float trans = d.transientStrength;
+    float pitchDrop = d.pitchDropSemitones;
+
+    if (f0 > 20.0f && f0 < 200.0f && sub > 0.15f && pitchDrop > 8.0f && dur < 1.0f)
+        return InstrumentType::Kick;
+    if (f0 > 20.0f && f0 < 200.0f && sub > 0.2f && dur > 0.3f && pitchDrop < 10.0f)
+        return InstrumentType::Bass;
+    if (bright > 0.15f && high > 0.3f && hnr < 0.6f && dur < 0.5f)
+        return InstrumentType::HiHat;
+    if (hnr < 0.5f && mid > 0.15f && dur < 0.5f && bright > 0.05f && bright < 0.4f)
+        return InstrumentType::Clap;
+    if (hnr > 0.2f && hnr < 1.2f && dur < 0.6f && (sub > 0.05f || mid > 0.1f))
+        return InstrumentType::Snare;
+    if (dur > 1.0f && trans < 4.0f)
+        return (hnr > 0.8f) ? InstrumentType::Pad : InstrumentType::Texture;
+    if (f0 > 200.0f && hnr > 0.8f && dur < 1.5f)
+        return InstrumentType::Lead;
+    if (dur < 0.8f)
+        return InstrumentType::Perc;
+    return InstrumentType::Unknown;
+}
+
+// ==========================================================================
+// Get best preset seed for this instrument type + descriptors
+// ==========================================================================
+inline MatchSynthParams getPresetSeed (InstrumentType type, const MatchDescriptors& d)
+{
+    using namespace universalsynth::genrerules;
+
+    auto tryGenres = [&] (auto genreFunc) -> MatchSynthParams
+    {
+        GenreStyle styles[] = {
+            GenreStyle::Trap, GenreStyle::HipHop, GenreStyle::Techno,
+            GenreStyle::House, GenreStyle::Reggaeton, GenreStyle::Afrobeat,
+            GenreStyle::RnB, GenreStyle::EDM, GenreStyle::Ambient
+        };
+
+        MatchSynthParams bestPreset;
+        float bestScore = 1e6f;
+
+        for (auto style : styles)
+        {
+            auto preset = genreFunc (style);
+            float pitchDiff = std::abs (preset.basePitch - d.fundamentalFreq) / std::max (30.0f, d.fundamentalFreq);
+            float durDiff = std::abs (preset.duration - d.totalDuration) / std::max (0.05f, d.totalDuration);
+            float score = pitchDiff + durDiff * 0.5f;
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestPreset = preset;
+            }
+        }
+        return bestPreset;
+    };
+
+    switch (type)
+    {
+        case InstrumentType::Kick:   return tryGenres (kickBase);
+        case InstrumentType::Snare:  return tryGenres (snareBase);
+        case InstrumentType::HiHat:  return tryGenres (hihatBase);
+        case InstrumentType::Clap:   return tryGenres (clapBase);
+        case InstrumentType::Perc:   return tryGenres (percBase);
+        case InstrumentType::Bass:   return tryGenres (bass808Base);
+        case InstrumentType::Lead:   return tryGenres (leadBase);
+        case InstrumentType::Pad:    return tryGenres (padBase);
+        case InstrumentType::Texture: return tryGenres (textureBase);
+        default:                     return tryGenres (kickBase);
+    }
+}
+
+// ==========================================================================
+// Core descriptor loss — KEPT for reporting only, NOT used in optimization
+// ==========================================================================
+inline float computeCoreLoss (const MatchDescriptors& ref, const MatchDescriptors& gen)
+{
+    if (! ref.valid || ! gen.valid) return 999.0f;
+
+    float dist = 0.0f;
+
+    auto nsd = [](float a, float b, float scale) -> float
+    {
+        float d = (a - b) / std::max (scale, 0.001f);
+        return d * d;
+    };
+
+    dist += 3.0f * nsd (ref.fundamentalFreq, gen.fundamentalFreq, std::max (10.0f, ref.fundamentalFreq * 0.15f));
+
+    {
+        float peDist = 0.0f;
+        for (int i = 0; i < MatchDescriptors::PITCH_ENV_POINTS; ++i)
+        {
+            float scale = std::max (20.0f, ref.pitchEnvelope[i]);
+            peDist += nsd (ref.pitchEnvelope[i], gen.pitchEnvelope[i], scale);
+        }
+        dist += 2.5f * peDist / (float) MatchDescriptors::PITCH_ENV_POINTS;
+    }
+
+    dist += 2.5f * nsd (ref.rmsLoudness, gen.rmsLoudness, std::max (0.03f, ref.rmsLoudness * 0.2f));
+    dist += 2.0f * nsd (ref.spectralCentroid, gen.spectralCentroid, std::max (30.0f, ref.spectralCentroid * 0.2f));
+
+    {
+        float stDist = 0.0f;
+        for (int f = 0; f < SPECTRO_FRAMES; f += 2)
+            for (int b = 0; b < SPECTRO_BANDS; b += 2)
+            {
+                int idx = f * SPECTRO_BANDS + b;
+                float diff = ref.spectroTemporal[idx] - gen.spectroTemporal[idx];
+                stDist += diff * diff;
+            }
+        dist += 3.0f * stDist / 16.0f;
+    }
+
+    {
+        float envDist = 0.0f;
+        for (int i = 0; i < MatchDescriptors::ENV_POINTS; ++i)
+            envDist += (ref.ampEnvelope[i] - gen.ampEnvelope[i]) * (ref.ampEnvelope[i] - gen.ampEnvelope[i]);
+        dist += 2.5f * envDist / (float) MatchDescriptors::ENV_POINTS;
+    }
+
+    dist += 2.0f * nsd (ref.subEnergy, gen.subEnergy, 0.06f);
+    dist += 1.5f * nsd (ref.totalDuration, gen.totalDuration, std::max (0.03f, ref.totalDuration * 0.2f));
+    dist += 0.5f * nsd (ref.lowMidEnergy, gen.lowMidEnergy, 0.07f);
+    dist += 0.5f * nsd (ref.midEnergy, gen.midEnergy, 0.1f);
+    dist += 0.5f * nsd (ref.highEnergy, gen.highEnergy, 0.05f);
+    dist += 1.0f * nsd (ref.transientStrength, gen.transientStrength, std::max (1.0f, ref.transientStrength * 0.3f));
+
+    return dist;
+}
+
+// ==========================================================================
+// CMA-ES (Covariance Matrix Adaptation Evolution Strategy)
+// Canonical implementation for continuous optimization in R^N
+// ==========================================================================
+struct CMAES
+{
+    int N = 0;         // dimension
+    int lambda = 0;    // population size
+    int mu = 0;        // parent count
+    std::vector<float> weights; // recombination weights
+    float muEff = 0.0f;
+
+    // Strategy parameters
+    float cc = 0.0f, cs = 0.0f, c1 = 0.0f, cmu_ = 0.0f, damps = 0.0f, chiN = 0.0f;
+
+    // State
+    std::vector<float> mean;                 // N
+    float sigma = 0.3f;                      // step size
+    std::vector<float> pc, ps;               // evolution paths
+    std::vector<std::vector<float>> C;       // covariance matrix NxN
+    std::vector<std::vector<float>> B;       // eigenvectors NxN
+    std::vector<float> D;                    // sqrt eigenvalues N
+    int eigenInterval = 1;
+    int eigenCounter = 0;
+    int generation = 0;
+
+    void init (int dim, const std::vector<float>& initialMean, float initialSigma)
+    {
+        N = dim;
+        lambda = std::max (20, 4 + (int)(3.0f * std::log ((float) N)));
+        mu = lambda / 2;
+        sigma = initialSigma;
+        generation = 0;
+
+        // Weights
+        weights.resize (mu);
+        float wSum = 0.0f;
+        for (int i = 0; i < mu; ++i)
+        {
+            weights[i] = std::log ((float) mu + 0.5f) - std::log ((float)(i + 1));
+            wSum += weights[i];
+        }
+        for (auto& w : weights) w /= wSum;
+
+        float wSqSum = 0.0f;
+        for (auto w : weights) wSqSum += w * w;
+        muEff = 1.0f / wSqSum;
+
+        // Strategy parameters
+        cc = (4.0f + muEff / (float) N) / ((float) N + 4.0f + 2.0f * muEff / (float) N);
+        cs = (muEff + 2.0f) / ((float) N + muEff + 5.0f);
+        c1 = 2.0f / (((float) N + 1.3f) * ((float) N + 1.3f) + muEff);
+        cmu_ = std::min (1.0f - c1,
+                         2.0f * (muEff - 2.0f + 1.0f / muEff) /
+                         (((float) N + 2.0f) * ((float) N + 2.0f) + muEff));
+        damps = 1.0f + 2.0f * std::max (0.0f, std::sqrt ((muEff - 1.0f) / ((float) N + 1.0f)) - 1.0f) + cs;
+        chiN = std::sqrt ((float) N) * (1.0f - 1.0f / (4.0f * (float) N) + 1.0f / (21.0f * (float) N * (float) N));
+
+        // State init
+        mean = initialMean;
+        pc.assign (N, 0.0f);
+        ps.assign (N, 0.0f);
+
+        // C = identity
+        C.assign (N, std::vector<float> (N, 0.0f));
+        B.assign (N, std::vector<float> (N, 0.0f));
+        D.assign (N, 1.0f);
+        for (int i = 0; i < N; ++i)
+        {
+            C[i][i] = 1.0f;
+            B[i][i] = 1.0f;
+        }
+
+        eigenInterval = std::max (1, N / 10);
+        eigenCounter = 0;
+    }
+
+    // Sample lambda candidates. Returns {samples, z_vectors}
+    std::pair<std::vector<std::vector<float>>, std::vector<std::vector<float>>>
+    samplePopulation (std::mt19937& rng, const float* mins, const float* maxs)
+    {
+        std::normal_distribution<float> normal (0.0f, 1.0f);
+
+        std::vector<std::vector<float>> samples (lambda, std::vector<float> (N));
+        std::vector<std::vector<float>> zVecs (lambda, std::vector<float> (N));
+
+        for (int k = 0; k < lambda; ++k)
+        {
+            // z ~ N(0, I)
+            for (int i = 0; i < N; ++i)
+                zVecs[k][i] = normal (rng);
+
+            // x = mean + sigma * B * D * z
+            for (int i = 0; i < N; ++i)
+            {
+                float sum = 0.0f;
+                for (int j = 0; j < N; ++j)
+                    sum += B[i][j] * D[j] * zVecs[k][j];
+                samples[k][i] = mean[i] + sigma * sum;
+            }
+
+            // Clamp to bounds
+            for (int i = 0; i < N; ++i)
+                samples[k][i] = std::max (mins[i], std::min (maxs[i], samples[k][i]));
+
+            // Round discrete params
+            samples[k][0] = std::round (std::max (0.0f, std::min (maxs[0], samples[k][0])));
+            if (N > 59) samples[k][59] = std::round (std::max (0.0f, std::min (3.0f, samples[k][59])));
+            if (N > 86) samples[k][86] = std::round (std::max (0.0f, std::min (2.0f, samples[k][86])));
+        }
+
+        return {samples, zVecs};
+    }
+
+    // Update CMA-ES state after evaluating population
+    void update (const std::vector<std::vector<float>>& samples,
+                 const std::vector<std::vector<float>>& zVecs,
+                 const std::vector<int>& ranking)
+    {
+        // New mean = weighted recombination of top mu
+        std::vector<float> oldMean = mean;
+        std::fill (mean.begin(), mean.end(), 0.0f);
+        for (int i = 0; i < mu; ++i)
+            for (int j = 0; j < N; ++j)
+                mean[j] += weights[i] * samples[ranking[i]][j];
+
+        // Mean displacement (in sigma units)
+        std::vector<float> meanShift (N);
+        for (int j = 0; j < N; ++j)
+            meanShift[j] = (mean[j] - oldMean[j]) / sigma;
+
+        // C^{-1/2} * meanShift (using B * D^{-1} * B^T)
+        std::vector<float> invsqrtCshift (N, 0.0f);
+        {
+            // BT * meanShift
+            std::vector<float> tmp (N, 0.0f);
+            for (int i = 0; i < N; ++i)
+                for (int j = 0; j < N; ++j)
+                    tmp[i] += B[j][i] * meanShift[j];
+            // D^{-1} * tmp
+            for (int i = 0; i < N; ++i)
+                tmp[i] /= std::max (1e-20f, D[i]);
+            // B * tmp
+            for (int i = 0; i < N; ++i)
+                for (int j = 0; j < N; ++j)
+                    invsqrtCshift[i] += B[i][j] * tmp[j];
+        }
+
+        // Update sigma path
+        float sqrtMuEff = std::sqrt (cs * (2.0f - cs) * muEff);
+        for (int i = 0; i < N; ++i)
+            ps[i] = (1.0f - cs) * ps[i] + sqrtMuEff * invsqrtCshift[i];
+
+        // ||ps|| for sigma update and hsig
+        float psNorm = 0.0f;
+        for (auto v : ps) psNorm += v * v;
+        psNorm = std::sqrt (psNorm);
+
+        // hsig: stall detection for pc update
+        float psThresh = (1.4f + 2.0f / ((float) N + 1.0f)) * chiN
+                         * std::sqrt (1.0f - std::pow (1.0f - cs, 2.0f * (float)(generation + 1)));
+        float hsig = (psNorm < psThresh) ? 1.0f : 0.0f;
+
+        // Update covariance path
+        float sqrtMuEffCC = std::sqrt (cc * (2.0f - cc) * muEff);
+        for (int i = 0; i < N; ++i)
+            pc[i] = (1.0f - cc) * pc[i] + hsig * sqrtMuEffCC * meanShift[i];
+
+        // Update covariance matrix
+        // C = (1 - c1 - cmu) * C + c1 * (pc*pc^T + (1-hsig)*cc*(2-cc)*C) + cmu * sum(w_i * z_i*z_i^T)
+        float c1a = c1 * (1.0f - (1.0f - hsig * hsig) * cc * (2.0f - cc));
+        float cOld = 1.0f - c1a - cmu_ * std::min (1.0f, (float) mu * 1.0f); // ensure non-negative
+
+        for (int i = 0; i < N; ++i)
+        {
+            for (int j = 0; j <= i; ++j)
+            {
+                float val = cOld * C[i][j];
+                val += c1 * pc[i] * pc[j];
+
+                float rankMu = 0.0f;
+                for (int k = 0; k < mu; ++k)
+                {
+                    // Use z vectors of selected parents
+                    // But we need y_k = (x_k - oldMean) / sigma
+                    float yi = (samples[ranking[k]][i] - oldMean[i]) / sigma;
+                    float yj = (samples[ranking[k]][j] - oldMean[j]) / sigma;
+                    rankMu += weights[k] * yi * yj;
+                }
+                val += cmu_ * rankMu;
+
+                C[i][j] = val;
+                C[j][i] = val; // symmetric
+            }
+        }
+
+        // Update sigma
+        sigma *= std::exp ((cs / damps) * (psNorm / chiN - 1.0f));
+        sigma = std::max (1e-12f, std::min (1e4f, sigma)); // safety bounds
+
+        // Eigendecomposition every eigenInterval generations
+        ++eigenCounter;
+        if (eigenCounter >= eigenInterval)
+        {
+            eigenDecompose();
+            eigenCounter = 0;
+        }
+
+        ++generation;
+    }
+
+    // Jacobi eigendecomposition of symmetric matrix C
+    void eigenDecompose()
+    {
+        // Work on a copy
+        auto A = C;
+        // V = identity (will accumulate eigenvectors)
+        auto V = B;
+        for (int i = 0; i < N; ++i)
+            for (int j = 0; j < N; ++j)
+                V[i][j] = (i == j) ? 1.0f : 0.0f;
+
+        const int maxSweeps = 15;
+        for (int sweep = 0; sweep < maxSweeps; ++sweep)
+        {
+            // Check convergence: sum of off-diagonal squared
+            float offDiag = 0.0f;
+            for (int i = 0; i < N; ++i)
+                for (int j = i + 1; j < N; ++j)
+                    offDiag += A[i][j] * A[i][j];
+
+            if (offDiag < 1e-12f * (float)(N * N)) break;
+
+            for (int p = 0; p < N; ++p)
+            {
+                for (int q = p + 1; q < N; ++q)
+                {
+                    if (std::abs (A[p][q]) < 1e-15f) continue;
+
+                    float tau = (A[q][q] - A[p][p]) / (2.0f * A[p][q]);
+                    float t = (tau >= 0.0f)
+                        ? 1.0f / (tau + std::sqrt (1.0f + tau * tau))
+                        : -1.0f / (-tau + std::sqrt (1.0f + tau * tau));
+                    float c = 1.0f / std::sqrt (1.0f + t * t);
+                    float s = t * c;
+
+                    // Rotate A
+                    float App = A[p][p], Aqq = A[q][q], Apq = A[p][q];
+                    A[p][p] = c * c * App - 2.0f * s * c * Apq + s * s * Aqq;
+                    A[q][q] = s * s * App + 2.0f * s * c * Apq + c * c * Aqq;
+                    A[p][q] = 0.0f;
+                    A[q][p] = 0.0f;
+
+                    for (int i = 0; i < N; ++i)
+                    {
+                        if (i == p || i == q) continue;
+                        float aip = A[i][p], aiq = A[i][q];
+                        A[i][p] = c * aip - s * aiq;
+                        A[p][i] = A[i][p];
+                        A[i][q] = s * aip + c * aiq;
+                        A[q][i] = A[i][q];
+                    }
+
+                    // Rotate V
+                    for (int i = 0; i < N; ++i)
+                    {
+                        float vip = V[i][p], viq = V[i][q];
+                        V[i][p] = c * vip - s * viq;
+                        V[i][q] = s * vip + c * viq;
+                    }
+                }
+            }
+        }
+
+        // Extract eigenvalues (diagonal of A) and eigenvectors (columns of V)
+        B = V;
+        for (int i = 0; i < N; ++i)
+        {
+            float eigenval = std::max (1e-20f, A[i][i]); // clamp positive
+            D[i] = std::sqrt (eigenval);
+        }
+    }
+};
+
+// ==========================================================================
+// Main optimizer class
+// ==========================================================================
 class OneShotMatchOptimizer
 {
 public:
-    void setMaxIterations (int n) { maxIterations = n; }
+    void setMaxIterations (int n) { maxGenerations = n; }
     void setTargetDistance (float d) { targetDistance = d; }
-    void setPopulationSize (int n) { popSize = n; }
+    void setPopulationSize (int n) { popSizeHint = n; }
 
-    // Set reference buffer for direct spectral comparison in NM refinement
     void setReferenceBuffer (const juce::AudioBuffer<float>* buf) { refBuffer = buf; }
+
+    // ==========================================================================
+    // Active parameter subsets per instrument type — TIMBRAL params only
+    // Structural params (pitch, duration, envelope) are LOCKED from descriptors.
+    // This reduces CMA-ES to ~25-30 dims instead of 88 → converges reliably.
+    // ==========================================================================
+    static std::vector<int> getActiveParamsForType (InstrumentType type)
+    {
+        std::vector<int> params;
+
+        // Common timbral core: oscType + layer levels + filter + saturation + effects
+        auto addCore = [&]() {
+            params.insert (params.end(), {0, 14, 15, 74, 75, 76, 77, 78, 82, 83, 84, 85, 86, 87});
+        };
+
+        switch (type)
+        {
+            case InstrumentType::Kick:
+            case InstrumentType::Bass:
+                addCore();
+                params.insert (params.end(), {16, 17, 18, 30, 31}); // FM, sub
+                params.insert (params.end(), {58, 59, 60, 61, 63, 65}); // transient
+                params.insert (params.end(), {67, 69}); // punchDecay, punchLevel
+                break;
+
+            case InstrumentType::Snare:
+                addCore();
+                params.insert (params.end(), {16, 17, 18}); // FM
+                params.insert (params.end(), {32, 33, 34, 35, 36, 42}); // noise
+                params.insert (params.end(), {58, 59, 60, 61, 63, 65}); // transient
+                params.insert (params.end(), {67, 69}); // punch
+                break;
+
+            case InstrumentType::HiHat:
+                addCore();
+                params.insert (params.end(), {46, 47, 48, 49, 50, 51, 52}); // modal
+                params.insert (params.end(), {32, 33, 34, 35, 36, 42}); // noise
+                params.insert (params.end(), {58, 59, 60, 61, 65}); // transient
+                break;
+
+            case InstrumentType::Clap:
+                addCore();
+                params.insert (params.end(), {32, 33, 34, 35, 36, 37, 38, 39, 42}); // noise + bursts
+                params.insert (params.end(), {58, 63, 65}); // transient
+                break;
+
+            case InstrumentType::Lead:
+                addCore();
+                params.insert (params.end(), {16, 17, 18, 19, 20, 21, 22, 23}); // FM + additive
+                params.insert (params.end(), {25, 26, 28, 29}); // unison, phase distort
+                params.insert (params.end(), {79, 80}); // formant
+                break;
+
+            case InstrumentType::Pad:
+            case InstrumentType::Texture:
+                addCore();
+                params.insert (params.end(), {19, 20, 21, 22, 23, 25, 26, 27}); // additive + unison
+                params.insert (params.end(), {32, 33, 36, 44, 45}); // noise + granular
+                params.insert (params.end(), {46, 48, 49, 50}); // modal
+                params.insert (params.end(), {70, 71}); // sustain
+                break;
+
+            default: // Perc, Unknown
+                addCore();
+                params.insert (params.end(), {16, 17, 30}); // FM, sub
+                params.insert (params.end(), {32, 33, 34, 36}); // noise
+                params.insert (params.end(), {46, 48, 49, 50}); // modal
+                params.insert (params.end(), {58, 59, 60, 61, 65}); // transient
+                break;
+        }
+
+        std::sort (params.begin(), params.end());
+        params.erase (std::unique (params.begin(), params.end()), params.end());
+        return params;
+    }
 
     OptimizationResult optimize (const MatchDescriptors& refDescFull,
                                  double sampleRate,
                                  ProgressCallback progress = nullptr,
                                  const MatchSynthParams* seedParams = nullptr)
     {
-        // Re-extract reference in fastMode (same features as candidates will use)
-        MatchDescriptors refDesc = refDescFull;
-        if (refBuffer != nullptr && refBuffer->getNumSamples() > 0)
-        {
-            extractor.setFastMode (true);
-            refDesc = extractor.extract (*refBuffer, sampleRate);
-            extractor.setFastMode (false);
-        }
-
-        // Prepare reference mono for STFT comparison in Nelder-Mead refinement
-        prepareRefMono (sampleRate, sampleRate);
-
         const int N = MatchSynthParams::NUM_PARAMS;
         float mins[N], maxs[N];
         MatchSynthParams::getBounds (mins, maxs);
 
-        // Apply learned bounds (narrowed search space from similar matches)
-        if (learnedProfile != nullptr && learnedProfile->valid && learnedProfile->boundsValid
-            && (int) learnedProfile->learnedMins.size() == N)
+        refHNR = refDescFull.harmonicNoiseRatio;
+        prepareRefMono (sampleRate, sampleRate);
+
+        // === STEP 1: Classify + get active timbral params ===
+        InstrumentType instrType = classifyInstrument (refDescFull);
+        detectedType = instrType;
+        std::vector<int> activeParams = getActiveParamsForType (instrType);
+        const int A = (int) activeParams.size();
+
+        // === STEP 2: Build base vector from descriptors (structural params LOCKED) ===
+        std::vector<float> baseVec (N);
         {
-            for (int i = 0; i < N; ++i)
-            {
-                // Narrow bounds but keep at least 30% of original range as safety margin
-                float origRange = maxs[i] - mins[i];
-                float newMin = std::max (mins[i], learnedProfile->learnedMins[i] - origRange * 0.15f);
-                float newMax = std::min (maxs[i], learnedProfile->learnedMaxs[i] + origRange * 0.15f);
-                if (newMax - newMin >= origRange * 0.3f) // only apply if >30% of range remains
-                {
-                    mins[i] = newMin;
-                    maxs[i] = newMax;
-                }
-            }
+            auto guess = descriptorGuess (refDescFull, instrType);
+            guess.toArray (baseVec.data());
         }
 
-        std::mt19937 rng (std::random_device{}());
-        std::uniform_real_distribution<float> uni (0.0f, 1.0f);
-
-        // === Active params — start with core + mix levels (always active) ===
-        std::vector<int> activeParams;
-        for (int i = 0; i < MatchSynthParams::NUM_CORE_PARAMS; ++i)
-            activeParams.push_back (i);
-        // v4 mix levels — always optimize from phase 1
-        activeParams.push_back (76); // bodyMix
-        activeParams.push_back (77); // subMix
-        activeParams.push_back (78); // clickMix
-        activeParams.push_back (79); // topMix
-        activeParams.push_back (105); // subCrossover — body/sub crossover frequency
-        // v5: subWavetable always active when wavetable is available
-        if (wavetable != nullptr && wavetable->valid)
-            activeParams.push_back (93); // subWavetable
-
-        // Pre-activate extensions from learned profile (skip gap analysis wait)
-        if (learnedProfile != nullptr && learnedProfile->valid)
+        // Blend timbral params with preset seed
+        std::vector<float> presetVec (N);
         {
-            for (int idx : learnedProfile->preActivateExtensions)
-            {
-                bool already = false;
-                for (int a : activeParams) if (a == idx) { already = true; break; }
-                if (! already) activeParams.push_back (idx);
-            }
+            auto preset = getPresetSeed (instrType, refDescFull);
+            preset.basePitch = (refDescFull.fundamentalFreq > 20.0f) ? refDescFull.fundamentalFreq : preset.basePitch;
+            preset.duration = refDescFull.totalDuration;
+            preset.toArray (presetVec.data());
         }
 
-        // === Population initialization ===
-        std::vector<std::vector<float>> pop (popSize, std::vector<float> (N));
-        std::vector<float> fitness (popSize, 999.0f);
-        std::vector<float> F_vec (popSize, 0.7f);
-        std::vector<float> CR_vec (popSize, 0.85f);
+        // For active (timbral) params: blend guess + preset
+        for (int j : activeParams)
+            baseVec[j] = 0.5f * baseVec[j] + 0.5f * presetVec[j];
 
-        // Set ALL extension params to their "off" default (0)
-        auto setExtensionDefaults = [&](std::vector<float>& vec)
-        {
-            for (int j = MatchSynthParams::NUM_CORE_PARAMS; j < N; ++j)
-                vec[j] = 0.0f;
-            // Non-zero defaults for ratio/freq/decay params (inactive since gate=0)
-            // v1 extensions
-            vec[23] = 2.0f;    // fmRatio
-            vec[24] = 0.05f;   // fmDecay
-            vec[26] = 200.0f;  // bodyResonFreq
-            vec[28] = 8.0f;    // wobbleRate
-            vec[29] = 0.05f;   // wobbleDecay
-            vec[31] = 0.001f;  // transientHold
-            vec[33] = 150.0f;  // combFreq
-            vec[34] = 0.3f;    // combFeedback
-            vec[38] = 0.05f;   // phaseDistDecay
-            // v2 extensions
-            vec[43] = 2.0f;    // harmonicDecayRate
-            vec[46] = 300.0f;  // reson2Freq
-            vec[48] = 600.0f;  // reson3Freq
-            vec[50] = 0.5f;    // noiseColor
-            vec[51] = 4000.0f; // noiseFilterFreq
-            vec[52] = 0.3f;    // noiseFilterQ
-            vec[56] = 1000.0f; // eqMidFreq
-            vec[59] = 0.1f;    // envSustainTime
-            vec[60] = 0.1f;    // envRelease
-            vec[61] = 1.0f;    // envCurve
-            vec[63] = 2000.0f; // stereoFreq
-            // v3 extensions
-            vec[65] = 10.0f;   // unisonDetune
-            vec[66] = 0.5f;    // unisonSpread
-            vec[68] = 700.0f;  // formantFreq1
-            vec[69] = 1500.0f; // formantFreq2
-            vec[71] = 5000.0f; // transLayerFreq
-            vec[72] = 0.003f;  // transLayerDecay
-            vec[74] = 0.3f;    // reverbDecay
-            vec[75] = 0.5f;    // reverbDamp
-            // v4 extensions — mix defaults (always active)
-            vec[76] = 0.50f;   // bodyMix
-            vec[77] = 0.50f;   // subMix
-            vec[78] = 0.10f;   // clickMix
-            vec[79] = 0.05f;   // topMix (low default — only raise if reference has HF)
-            vec[80] = 0.0f;    // filterSweepAmt (off)
-            vec[81] = 8000.0f; // filterSweepStart
-            vec[82] = 500.0f;  // filterSweepEnd
-            vec[83] = 0.3f;    // filterSweepReso
-            vec[84] = 0.0f;    // subPitch (follow body)
-            vec[85] = 0.5f;    // formantQ
-            // v5 extensions
-            vec[86] = 0.0f;    // residualAmt (off)
-            vec[87] = 0.5f;    // residualLevel
-            vec[88] = 0.0f;    // harmonic5
-            vec[89] = 0.0f;    // harmonic6
-            vec[90] = 0.0f;    // harmonic7
-            vec[91] = 0.0f;    // harmonic8
-            vec[92] = 0.0f;    // spectralMatchAmt (off)
-            vec[93] = 0.0f;    // subWavetable (off)
-            vec[94] = 0.0f;    // transientSampleAmt (off)
-            // v6 extensions
-            vec[95] = 0.0f;    // pitchBounce (off)
-            vec[96] = 0.0f;    // pitchHoldTime
-            vec[97] = 0.0f;    // clickType (noise)
-            vec[98] = 0.0f;    // masterSatAmount (off)
-            vec[99] = 0.0f;    // masterSatType (soft-clip)
-            vec[100] = 0.0f;   // subPhaseOffset
-            vec[101] = 0.0f;   // compAmount (off)
-            vec[102] = 4.0f;   // compRatio
-            vec[103] = 0.005f; // compAttack
-            vec[104] = 0.05f;  // compRelease
-            vec[105] = 0.0f;   // subCrossover (auto)
-        };
-
-        // === Warm-start or descriptor-based seeding ===
+        // Blend with user seed if provided
         if (seedParams != nullptr)
         {
-            // Individual 0: exact seed
-            seedParams->toArray (pop[0].data());
-            setExtensionDefaults (pop[0]);
-
-            // Individuals 1-4: perturbed versions of the seed
-            for (int i = 1; i < std::min (5, popSize); ++i)
-            {
-                pop[i] = pop[0];
-                for (int j : activeParams)
-                {
-                    float range = maxs[j] - mins[j];
-                    float perturbation = (uni (rng) - 0.5f) * 0.3f * range;
-                    pop[i][j] = std::max (mins[j], std::min (maxs[j], pop[i][j] + perturbation));
-                }
-                pop[i][0] = std::max (0.0f, std::min ((float) maxOscType, std::round (pop[i][0])));
-                setExtensionDefaults (pop[i]);
-            }
-
-            // Individual 5: descriptor-based guess (same logic as no-seed path)
-            if (popSize > 5)
-            {
-                MatchSynthParams guess;
-                guess.basePitch = (refDesc.fundamentalFreq > 20.0f) ? refDesc.fundamentalFreq : 50.0f;
-                guess.pitchEnvDepth = std::max (0.0f, refDesc.pitchDropSemitones);
-                guess.pitchEnvFast = std::max (0.0005f, std::min (0.005f, refDesc.pitchDropTime * 0.1f));
-                guess.pitchEnvSlow = std::max (0.005f, refDesc.pitchDropTime);
-                guess.ampAttack = std::max (0.0001f, std::min (0.01f, refDesc.attackTime));
-                guess.ampPunchDecay = std::max (0.01f, refDesc.decayTime * 0.6f);
-                guess.ampBodyDecay = std::max (0.05f, refDesc.decayTime);
-                guess.subTailDecay = std::max (0.05f, refDesc.decayTime40);
-                guess.clickAmount = std::min (1.0f, std::max (0.1f, refDesc.transientStrength / 4.0f));
-                guess.ampPunchLevel = (refDesc.transientStrength > 4.0f) ? 0.7f : 0.5f;
-                guess.clickFreq = std::max (2000.0f, refDesc.transientRegion.spectralCentroid);
-                guess.distortion = (refDesc.harmonicNoiseRatio > 0.4f) ? 0.3f : 0.0f;
-                // Filter cutoff from spectral rolloff
-                guess.filterCutoff = std::max (200.0f, refDesc.spectralRolloff * 2.5f);
-                guess.subLevel = std::max (0.1f, std::min (0.8f, refDesc.subEnergy * 0.8f));
-                guess.subDetune = (refDesc.subHarmonicRatio > 0.1f)
-                    ? std::min (3.0f, refDesc.subHarmonicRatio * 5.0f) : 0.0f;
-                if (refDesc.noiseSpectralCentroid > 100.0f && refDesc.harmonicNoiseRatio < 0.7f)
-                    guess.noiseAmount = std::min (0.5f, (1.0f - refDesc.harmonicNoiseRatio) * 0.6f);
-                else
-                    guess.noiseAmount = std::min (0.3f, std::max (0.0f, refDesc.highEnergy * 2.0f));
-                if (refDesc.fundamentalFreq > 20.0f)
-                {
-                    guess.bodyHarmonics = std::min (0.6f, std::max (0.0f,
-                        (refDesc.harmonicProfile[1] + refDesc.harmonicProfile[2]) * 0.5f));
-                    guess.harmonicEmphasis = std::min (0.5f, refDesc.harmonicProfile[1] * 0.5f);
-                }
-                else
-                {
-                    guess.bodyHarmonics = std::min (0.5f, std::max (0.0f, (1.0f - refDesc.bodyRegion.spectralFlatness) * 0.3f));
-                    guess.harmonicEmphasis = std::min (0.5f, std::max (0.0f, refDesc.lowMidEnergy));
-                }
-                if (refDesc.spectralCrest < 3.0f && refDesc.harmonicNoiseRatio > 0.4f)
-                    guess.distortion = std::min (0.5f, (1.0f - refDesc.spectralCrest / 10.0f) * 0.4f);
-                guess.pitchEnvBalance = (refDesc.pitchDropSemitones > 12.0f) ? 0.85f : 0.5f;
-                guess.clickWidth = std::max (0.2f, std::min (1.0f, refDesc.brightness * 2.0f + 0.3f));
-                guess.clickDecay = std::max (0.0003f, std::min (0.003f, refDesc.attackTime * 0.3f));
-                // Crossover: set at fundamentalFreq * 1.7 (above fundamental, below 2nd harmonic)
-                guess.subCrossover = (refDesc.fundamentalFreq > 20.0f) ? refDesc.fundamentalFreq * 1.7f : 90.0f;
-                // Prefer wavetable when available - it captures the exact timbre of the reference
-                if (wavetable != nullptr && wavetable->valid)
-                    guess.oscType = 12; // wavetable from reference
-                // For dark kicks with lots of lowMid energy, saw or clipped sine work best
-                else if (refDesc.lowMidEnergy > 0.2f && refDesc.brightness < 0.01f)
-                    guess.oscType = 2; // saw
-                // Body/sub mix balance from energy bands
-                guess.bodyMix = std::max (0.3f, std::min (1.0f, refDesc.lowMidEnergy * 2.0f + 0.2f));
-                guess.subMix = std::max (0.1f, std::min (0.8f, refDesc.subEnergy * 0.9f));
-                guess.subLevel = std::max (0.1f, std::min (0.8f, refDesc.subEnergy * 0.8f));
-                guess.clickMix = std::max (0.1f, std::min (1.0f, refDesc.transientStrength / 6.0f));
-                guess.topMix = std::max (0.05f, std::min (1.0f, refDesc.highEnergy * 3.0f + 0.1f));
-                // Suppress click/noise for dark kicks
-                if (refDesc.brightness < 0.005f) {
-                    guess.clickAmount = 0.0f;
-                    guess.clickMix = 0.0f;
-                    guess.topMix = 0.0f;
-                    guess.noiseAmount = 0.0f;
-                }
-                guess.toArray (pop[5].data());
-                setExtensionDefaults (pop[5]);
-            }
-
-            // Random for the rest
-            for (int i = 6; i < popSize; ++i)
-            {
-                for (int j : activeParams)
-                    pop[i][j] = mins[j] + uni (rng) * (maxs[j] - mins[j]);
-                pop[i][0] = std::max (0.0f, std::min ((float) maxOscType, std::round (pop[i][0])));
-                setExtensionDefaults (pop[i]);
-            }
-        }
-        else
-        {
-            // No seed: descriptor-based guess at individual 0
-            {
-                MatchSynthParams guess;
-                guess.basePitch = (refDesc.fundamentalFreq > 20.0f) ? refDesc.fundamentalFreq : 50.0f;
-                guess.pitchEnvDepth = std::max (0.0f, refDesc.pitchDropSemitones);
-                guess.pitchEnvFast = std::max (0.0005f, std::min (0.005f, refDesc.pitchDropTime * 0.1f));
-                guess.pitchEnvSlow = std::max (0.005f, refDesc.pitchDropTime);
-                guess.ampAttack = std::max (0.0001f, std::min (0.01f, refDesc.attackTime));
-                guess.ampPunchDecay = std::max (0.01f, refDesc.decayTime * 0.6f);
-                guess.ampBodyDecay = std::max (0.05f, refDesc.decayTime);
-                guess.subTailDecay = std::max (0.05f, refDesc.decayTime40);
-                guess.clickAmount = std::min (1.0f, std::max (0.1f, refDesc.transientStrength / 4.0f));
-                guess.ampPunchLevel = (refDesc.transientStrength > 4.0f) ? 0.7f : 0.5f;
-                guess.clickFreq = std::max (2000.0f, refDesc.transientRegion.spectralCentroid);
-                guess.distortion = (refDesc.harmonicNoiseRatio > 0.4f) ? 0.3f : 0.0f;
-                // Filter cutoff from spectral rolloff
-                guess.filterCutoff = std::max (200.0f, refDesc.spectralRolloff * 2.5f);
-                guess.subLevel = std::max (0.1f, std::min (0.8f, refDesc.subEnergy * 0.8f));
-                guess.subDetune = (refDesc.subHarmonicRatio > 0.1f)
-                    ? std::min (3.0f, refDesc.subHarmonicRatio * 5.0f) : 0.0f;
-                if (refDesc.noiseSpectralCentroid > 100.0f && refDesc.harmonicNoiseRatio < 0.7f)
-                    guess.noiseAmount = std::min (0.5f, (1.0f - refDesc.harmonicNoiseRatio) * 0.6f);
-                else
-                    guess.noiseAmount = std::min (0.3f, std::max (0.0f, refDesc.highEnergy * 2.0f));
-                if (refDesc.fundamentalFreq > 20.0f)
-                {
-                    guess.bodyHarmonics = std::min (0.6f, std::max (0.0f,
-                        (refDesc.harmonicProfile[1] + refDesc.harmonicProfile[2]) * 0.5f));
-                    guess.harmonicEmphasis = std::min (0.5f, refDesc.harmonicProfile[1] * 0.5f);
-                }
-                else
-                {
-                    guess.bodyHarmonics = std::min (0.5f, std::max (0.0f, (1.0f - refDesc.bodyRegion.spectralFlatness) * 0.3f));
-                    guess.harmonicEmphasis = std::min (0.5f, std::max (0.0f, refDesc.lowMidEnergy));
-                }
-                if (refDesc.spectralCrest < 3.0f && refDesc.harmonicNoiseRatio > 0.4f)
-                    guess.distortion = std::min (0.5f, (1.0f - refDesc.spectralCrest / 10.0f) * 0.4f);
-                guess.pitchEnvBalance = (refDesc.pitchDropSemitones > 12.0f) ? 0.85f : 0.5f;
-                guess.clickWidth = std::max (0.2f, std::min (1.0f, refDesc.brightness * 2.0f + 0.3f));
-                guess.clickDecay = std::max (0.0003f, std::min (0.003f, refDesc.attackTime * 0.3f));
-                // Crossover: set at fundamentalFreq * 1.7 (above fundamental, below 2nd harmonic)
-                guess.subCrossover = (refDesc.fundamentalFreq > 20.0f) ? refDesc.fundamentalFreq * 1.7f : 90.0f;
-                // Prefer wavetable when available - it captures the exact timbre of the reference
-                if (wavetable != nullptr && wavetable->valid)
-                    guess.oscType = 12; // wavetable from reference
-                // For dark kicks with lots of lowMid energy, saw or clipped sine work best
-                else if (refDesc.lowMidEnergy > 0.2f && refDesc.brightness < 0.01f)
-                    guess.oscType = 2; // saw
-                // Body/sub mix balance from energy bands
-                guess.bodyMix = std::max (0.3f, std::min (1.0f, refDesc.lowMidEnergy * 2.0f + 0.2f));
-                guess.subMix = std::max (0.1f, std::min (0.8f, refDesc.subEnergy * 0.9f));
-                guess.subLevel = std::max (0.1f, std::min (0.8f, refDesc.subEnergy * 0.8f));
-                guess.clickMix = std::max (0.1f, std::min (1.0f, refDesc.transientStrength / 6.0f));
-                guess.topMix = std::max (0.05f, std::min (1.0f, refDesc.highEnergy * 3.0f + 0.1f));
-                // Suppress click/noise for dark kicks
-                if (refDesc.brightness < 0.005f) {
-                    guess.clickAmount = 0.0f;
-                    guess.clickMix = 0.0f;
-                    guess.topMix = 0.0f;
-                    guess.noiseAmount = 0.0f;
-                }
-                guess.toArray (pop[0].data());
-                setExtensionDefaults (pop[0]);
-            }
-
-            // Seed a few more with perturbed versions of the guess
-            for (int i = 1; i < std::min (5, popSize); ++i)
-            {
-                pop[i] = pop[0];
-                for (int j : activeParams)
-                {
-                    float range = maxs[j] - mins[j];
-                    float perturbation = (uni (rng) - 0.5f) * 0.3f * range;
-                    pop[i][j] = std::max (mins[j], std::min (maxs[j], pop[i][j] + perturbation));
-                }
-                pop[i][0] = std::max (0.0f, std::min ((float) maxOscType, std::round (pop[i][0])));
-                setExtensionDefaults (pop[i]);
-            }
-
-            // Random for the rest
-            for (int i = 5; i < popSize; ++i)
-            {
-                for (int j : activeParams)
-                    pop[i][j] = mins[j] + uni (rng) * (maxs[j] - mins[j]);
-                pop[i][0] = std::max (0.0f, std::min ((float) maxOscType, std::round (pop[i][0])));
-                setExtensionDefaults (pop[i]);
-            }
+            std::vector<float> seedVec (N);
+            seedParams->toArray (seedVec.data());
+            for (int j : activeParams)
+                baseVec[j] = 0.5f * baseVec[j] + 0.5f * seedVec[j];
         }
 
-        // === OscType screening: evaluate all 12 types with the guess params ===
-        std::vector<std::pair<float, int>> oscScores;
+        // === STEP 2b: Tighten bounds on structural params ===
         {
-            auto testVec = pop[0]; // copy the best guess
+            float f0 = refDescFull.fundamentalFreq;
+            float dur = refDescFull.totalDuration;
+
+            if (f0 > 20.0f) { mins[1] = f0 * 0.95f; maxs[1] = f0 * 1.05f; }
+            mins[2] = std::max (0.01f, dur * 0.85f);
+            maxs[2] = std::min (5.0f, dur * 1.15f);
+            mins[3] = 0.8f; maxs[3] = 1.0f;
+
+            if (refDescFull.pitchDropSemitones > 2.0f)
+            {
+                mins[6] = refDescFull.pitchDropSemitones * 0.75f;
+                maxs[6] = refDescFull.pitchDropSemitones * 1.25f;
+            }
+            else { mins[6] = 0.0f; maxs[6] = 3.0f; }
+
+            if (refDescFull.pitchDropTime > 0.001f)
+            {
+                mins[7] = std::max (0.0003f, refDescFull.pitchDropTime * 0.1f);
+                maxs[7] = std::min (0.05f, refDescFull.pitchDropTime * 0.3f);
+                mins[8] = std::max (0.003f, refDescFull.pitchDropTime * 0.7f);
+                maxs[8] = std::min (0.5f, refDescFull.pitchDropTime * 1.3f);
+            }
+
+            float att = std::max (0.0001f, refDescFull.attackTime);
+            mins[66] = std::max (0.0001f, att * 0.5f);
+            maxs[66] = std::min (0.05f, att * 2.0f);
+
+            float dec = std::max (0.005f, refDescFull.decayTime);
+            mins[67] = std::max (0.005f, dec * 0.3f);
+            maxs[67] = std::min (0.5f, dec * 3.0f);
+            mins[68] = std::max (0.02f, refDescFull.decayTime40 * 0.5f);
+            maxs[68] = std::min (3.0f, refDescFull.decayTime40 * 2.0f);
+
+            mins[72] = 0.005f;
+            maxs[72] = std::min (1.0f, dur * 0.4f);
+
+            float detectedCurve = std::max (0.3f, std::min (3.0f, refDescFull.envelopeShape * 2.5f + 0.3f));
+            mins[73] = std::max (0.1f, detectedCurve * 0.4f);
+            maxs[73] = std::min (4.0f, detectedCurve * 2.5f);
+
+            // filterCutoff: must preserve spectral content
+            mins[74] = std::max (200.0f, refDescFull.spectralRolloff * 2.0f);
+            maxs[75] = 0.5f; // filterReso
+
+            maxs[82] = 0.4f; maxs[84] = 0.3f; maxs[87] = 0.5f;
+        }
+
+        // Clamp base vector
+        for (int i = 0; i < N; ++i)
+            baseVec[i] = std::max (mins[i], std::min (maxs[i], baseVec[i]));
+
+        // === STEP 3: OscType screening ===
+        {
+            auto testVec = baseVec;
+            std::vector<std::pair<float, int>> oscScores;
             for (int osc = 0; osc <= maxOscType; ++osc)
             {
                 testVec[0] = (float) osc;
-                float fit = evaluate (testVec.data(), refDesc, sampleRate);
+                float fit = evaluate (testVec.data(), sampleRate);
                 oscScores.push_back ({fit, osc});
             }
             std::sort (oscScores.begin(), oscScores.end());
-
-            int bestOsc = oscScores[0].second;
-            int secondOsc = oscScores[1].second;
-            int thirdOsc = oscScores[2].second;
-
-            // If wavetable available, always include it in top 3
-            if (wavetable != nullptr && wavetable->valid)
-            {
-                bool wtInTop3 = (bestOsc == 12 || secondOsc == 12 || thirdOsc == 12);
-                if (!wtInTop3) thirdOsc = 12;
-            }
-
-            // If learned profile has a preferred oscType, boost it if it's in top 5
-            if (learnedProfile != nullptr && learnedProfile->valid && learnedProfile->preferredOscType >= 0)
-            {
-                int pref = learnedProfile->preferredOscType;
-                bool inTop3 = (pref == bestOsc || pref == secondOsc || pref == thirdOsc);
-                if (! inTop3)
-                {
-                    // Check if it's at least in top 5
-                    for (int k = 3; k < std::min (5, (int) oscScores.size()); ++k)
-                    {
-                        if (oscScores[k].second == pref)
-                        {
-                            thirdOsc = pref; // replace 3rd with learned preference
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Distribute population across top 3 oscTypes
-            for (int i = 0; i < popSize; ++i)
-            {
-                if (i < popSize * 2 / 5)         pop[i][0] = (float) bestOsc;    // 40%
-                else if (i < popSize * 13 / 20)  pop[i][0] = (float) secondOsc;  // 25%
-                else if (i < popSize * 3 / 4)    pop[i][0] = (float) thirdOsc;   // 15%
-                // rest: random oscType (already set)
-            }
+            baseVec[0] = (float) oscScores[0].second;
         }
 
-        // === Narrow bounds for structural params based on reference descriptors ===
-        // These params define the temporal/pitch structure and must stay close to the reference.
-        // The optimizer should focus on timbral params (harmonics, mix, distortion, etc.)
+        // === STEP 4: CMA-ES in active param subspace (A dims, not 88) ===
+        // Extract active params into sub-vector for CMA-ES
+        std::vector<float> subMean (A);
+        std::vector<float> subMins (A), subMaxs (A);
+        for (int i = 0; i < A; ++i)
         {
-            auto narrow = [&](int idx, float center, float margin)
-            {
-                float lo = std::max (mins[idx], center * (1.0f - margin));
-                float hi = std::min (maxs[idx], center * (1.0f + margin));
-                if (hi > lo) { mins[idx] = lo; maxs[idx] = hi; }
-            };
-            auto narrowAbs = [&](int idx, float center, float halfRange)
-            {
-                float lo = std::max (mins[idx], center - halfRange);
-                float hi = std::min (maxs[idx], center + halfRange);
-                if (hi > lo) { mins[idx] = lo; maxs[idx] = hi; }
-            };
-
-            // === HARD LOCK structural params with DIRECT assignments ===
-            // No narrow() — direct min/max to guarantee they apply.
-
-            float f0 = std::max (30.0f, refDescFull.fundamentalFreq);
-
-            // basePitch: ±10% of fundamental
-            mins[1] = f0 * 0.9f;
-            maxs[1] = f0 * 1.1f;
-
-            // pitchEnvDepth: ±4st of detected, min 0
-            mins[3] = std::max (0.0f, refDescFull.pitchDropSemitones - 4.0f);
-            maxs[3] = refDescFull.pitchDropSemitones + 4.0f;
-
-            // pitchEnvFast: 0.3-5ms
-            mins[4] = 0.0003f;
-            maxs[4] = 0.005f;
-
-            // pitchEnvSlow: ±40% of drop time
-            if (refDescFull.pitchDropTime > 0.002f)
-            {
-                mins[5] = refDescFull.pitchDropTime * 0.6f;
-                maxs[5] = refDescFull.pitchDropTime * 1.4f;
-            }
-
-            // ampAttack: 0.1ms to max(50ms, attackTime*2)
-            mins[7] = 0.0001f;
-            maxs[7] = std::max (0.05f, refDescFull.attackTime * 2.0f);
-
-            // subTailDecay: max = totalDuration * 0.8
-            maxs[12] = std::min (maxs[12], std::max (0.1f, refDescFull.totalDuration * 0.8f));
-
-            // filterCutoff: based on spectral content
-            {
-                float fc = std::max (200.0f, refDescFull.spectralRolloff * 2.5f);
-                mins[20] = fc * 0.5f;
-                maxs[20] = std::min (maxs[20], fc * 2.0f);
-            }
-
-            // subPitch: LOCK to 0 (follow body pitch) — prevent independent sub freq
-            mins[84] = 0.0f;
-            maxs[84] = 0.0f;
-
-            // subCrossover: near fundamental * 1.7
-            {
-                float xover = f0 * 1.7f;
-                mins[105] = xover * 0.6f;
-                maxs[105] = xover * 1.5f;
-            }
-
-            // bodyMix: minimum 0.3 (body must be present)
-            mins[76] = 0.3f;
-
-            // distortion: cap proportional to harmonic content
-            // Clean sounds (HNR close to 2.0 = pure tone) need little distortion
-            maxs[18] = std::max (0.1f, std::min (1.0f, (2.0f - refDescFull.harmonicNoiseRatio) * 3.0f));
-            // For this kick: HNR=1.988, so max = (2-1.988)*3 = 0.036. Very little distortion.
-
-            // Suppress click/noise/top based on reference HF content
-            // topMix scales with highEnergy; if no high energy, cap it
-            maxs[79] = std::max (0.05f, std::min (1.0f, refDescFull.highEnergy * 20.0f + 0.05f)); // topMix
-            if (refDescFull.brightness < 0.01f)
-            {
-                maxs[14] = 0.15f;   // clickAmount
-                maxs[19] = 0.15f;   // noiseAmount
-                maxs[78] = 0.15f;   // clickMix
-            }
+            int j = activeParams[i];
+            subMean[i] = baseVec[j];
+            subMins[i] = mins[j];
+            subMaxs[i] = maxs[j];
         }
 
-        // Evaluate initial population
-        for (int i = 0; i < popSize; ++i)
+        // Normalize to [0,1]
+        std::vector<float> normMean (A);
+        for (int i = 0; i < A; ++i)
         {
-            pop[i][0] = std::max (0.0f, std::min ((float) maxOscType, std::round (pop[i][0])));
-            // Clamp to narrowed bounds
-            for (int j : activeParams)
-                pop[i][j] = std::max (mins[j], std::min (maxs[j], pop[i][j]));
-            fitness[i] = evaluate (pop[i].data(), refDesc, sampleRate);
+            float range = subMaxs[i] - subMins[i];
+            normMean[i] = (range > 1e-10f) ? (subMean[i] - subMins[i]) / range : 0.5f;
         }
+        std::vector<float> normMins (A, 0.0f), normMaxs (A, 1.0f);
 
-        int bestIdx = 0;
-        for (int i = 1; i < popSize; ++i)
-            if (fitness[i] < fitness[bestIdx]) bestIdx = i;
+        CMAES cma;
+        cma.init (A, normMean, 0.25f); // wider sigma OK because fewer dims
+
+        std::mt19937 rng (std::random_device{}());
 
         OptimizationResult result;
+        float bestFitness = 1e6f;
+        std::vector<float> bestVec = baseVec;
 
-        // Multi-pass iteration budget
-        int phase1Iters = maxIterations / 2;              // 50% — core only (125)
-        int phase2Iters = (maxIterations * 3) / 10;       // 30% — core + ext1 (75)
-        int phase3Iters = maxIterations - phase1Iters - phase2Iters; // 20% — all active (50)
-        int totalReportIters = maxIterations;
-
-        // Convergence tracking
-        float prevBest = fitness[bestIdx];
+        int totalGens = maxGenerations;
         int stagnationCount = 0;
-        const int stagnationLimit = 15;
-        const float improvementEpsilon = 0.0003f;
-        int globalIter = 0;
+        const int stagnationLimit = 60;
         int restartsUsed = 0;
-        const int maxRestarts = 2;
 
-        // Partial restart: keep top 30%, re-randomize bottom 70% near best
-        auto partialRestart = [&]()
+        // Helper: inject sub-vector into full 88-param vector
+        auto injectParams = [&](const std::vector<float>& sub) -> std::vector<float>
         {
-            // Sort population by fitness
-            std::vector<int> sortedIdx (popSize);
-            std::iota (sortedIdx.begin(), sortedIdx.end(), 0);
-            std::sort (sortedIdx.begin(), sortedIdx.end(),
-                       [&](int a, int b) { return fitness[a] < fitness[b]; });
-
-            int keepCount = std::max (2, popSize * 3 / 10); // keep top 30%
-            for (int rank = keepCount; rank < popSize; ++rank)
+            auto full = baseVec;
+            for (int i = 0; i < A; ++i)
             {
-                int i = sortedIdx[rank];
-                // Perturb around best individual with moderate noise
-                pop[i] = pop[bestIdx];
-                for (int j : activeParams)
-                {
-                    float range = maxs[j] - mins[j];
-                    float noise = (uni (rng) - 0.5f) * 0.5f * range;
-                    pop[i][j] = std::max (mins[j], std::min (maxs[j], pop[i][j] + noise));
-                }
-                pop[i][0] = std::max (0.0f, std::min ((float) maxOscType, std::round (pop[i][0])));
-                fitness[i] = evaluate (pop[i].data(), refDesc, sampleRate);
-                if (fitness[i] < fitness[bestIdx]) bestIdx = i;
+                int j = activeParams[i];
+                float range = subMaxs[i] - subMins[i];
+                full[j] = subMins[i] + sub[i] * range;
+                full[j] = std::max (mins[j], std::min (maxs[j], full[j]));
             }
-            stagnationCount = 0;
-            prevBest = fitness[bestIdx];
+            full[0] = std::round (std::max (0.0f, std::min ((float) maxOscType, full[0])));
+            if (N > 59) full[59] = std::round (std::max (0.0f, std::min (3.0f, full[59])));
+            if (N > 86) full[86] = std::round (std::max (0.0f, std::min (2.0f, full[86])));
+            return full;
         };
 
-        // === PHASE 1: DE on core params only (50% budget) ===
-        for (int iter = 0; iter < phase1Iters; ++iter)
+        // === STEP 5: CMA-ES Main Loop ===
+        for (int gen = 0; gen < totalGens; ++gen)
         {
-            runDEGeneration (pop, fitness, F_vec, CR_vec, activeParams,
-                             mins, maxs, bestIdx, refDesc, sampleRate, rng, uni,
-                             (float) globalIter / (float) totalReportIters);
+            auto [normSamples, zVecs] = cma.samplePopulation (rng, normMins.data(), normMaxs.data());
 
-            ++globalIter;
-            result.iterations = globalIter;
-            result.bestDistance = fitness[bestIdx];
-
-            if (progress && ! progress (globalIter, fitness[bestIdx], totalReportIters))
-                break;
-
-            if (fitness[bestIdx] < targetDistance)
+            // Evaluate in full 88-param space
+            std::vector<std::vector<float>> fullSamples (cma.lambda);
+            std::vector<float> fitnesses (cma.lambda);
+            for (int k = 0; k < cma.lambda; ++k)
             {
-                result.converged = true;
-                break;
+                fullSamples[k] = injectParams (normSamples[k]);
+                fitnesses[k] = evaluate (fullSamples[k].data(), sampleRate);
             }
 
-            // Convergence detection with partial restart
-            float improvement = prevBest - fitness[bestIdx];
-            if (improvement < improvementEpsilon) ++stagnationCount;
-            else stagnationCount = 0;
-            prevBest = fitness[bestIdx];
+            // Ranking
+            std::vector<int> ranking (cma.lambda);
+            std::iota (ranking.begin(), ranking.end(), 0);
+            std::sort (ranking.begin(), ranking.end(), [&](int a, int b) {
+                return fitnesses[a] < fitnesses[b];
+            });
 
-            if (stagnationCount >= stagnationLimit)
+            if (fitnesses[ranking[0]] < bestFitness)
             {
-                if (restartsUsed < maxRestarts)
-                {
-                    partialRestart();
-                    ++restartsUsed;
-                }
-                else
-                    break;
-            }
-        }
-
-        result.phase1Iterations = globalIter;
-        result.phase1Distance = fitness[bestIdx];
-
-        // === GAP ANALYSIS #1 ===
-        if (! result.converged)
-        {
-            // Generate best sound and extract descriptors for gap analysis
-            MatchSynthParams bestP;
-            bestP.fromArray (pop[bestIdx].data());
-            auto bestBuffer = synth.generate (bestP, sampleRate);
-            extractor.setFastMode (true);
-            auto matchedDesc = extractor.extract (bestBuffer, sampleRate);
-            extractor.setFastMode (false);
-
-            auto gaps1 = analyzeGaps (refDesc, matchedDesc);
-            result.gaps = gaps1;
-            result.extensionsActivated = gaps1.extensionCount();
-
-            if (result.extensionsActivated > 0)
-            {
-                // Activate extension params
-                auto extIndices = gaps1.getExtensionIndices();
-                for (int idx : extIndices)
-                    activeParams.push_back (idx);
-
-                // Initialize extension params in population
-                // Best individual: seed extension gate params at moderate value
-                for (int idx : extIndices)
-                {
-                    int gateIdx = MatchSynthParams::getExtensionGateIndex (idx);
-                    if (idx == gateIdx)
-                    {
-                        // Gate param: start at moderate value
-                        pop[bestIdx][idx] = 0.3f;
-                    }
-                    // Other extension params: keep at sensible defaults (already set)
-                }
-
-                // Perturb rest of population's extension params
-                for (int i = 0; i < popSize; ++i)
-                {
-                    if (i == bestIdx) continue;
-                    for (int idx : extIndices)
-                    {
-                        float range = maxs[idx] - mins[idx];
-                        pop[i][idx] = mins[idx] + uni (rng) * range;
-                    }
-                    fitness[i] = evaluate (pop[i].data(), refDesc, sampleRate);
-                }
-
-                // Update best
-                for (int i = 0; i < popSize; ++i)
-                    if (fitness[i] < fitness[bestIdx]) bestIdx = i;
-
-                // Reset stagnation for phase 2
+                bestFitness = fitnesses[ranking[0]];
+                bestVec = fullSamples[ranking[0]];
                 stagnationCount = 0;
-                prevBest = fitness[bestIdx];
+            }
+            else
+            {
+                ++stagnationCount;
+            }
 
-                // === PHASE 2: DE on core + ext1 (30% budget) ===
-                restartsUsed = 0;
-                for (int iter = 0; iter < phase2Iters; ++iter)
+            cma.update (normSamples, zVecs, ranking);
+
+            result.iterations = (gen + 1) * cma.lambda;
+            result.bestDistance = bestFitness;
+            result.cmaGenerations = gen + 1;
+
+            if (progress && ! progress (gen + 1, bestFitness, totalGens))
+                break;
+
+            if (bestFitness < targetDistance) { result.converged = true; break; }
+
+            // Stagnation or sigma collapse → ALWAYS restart (never stop early)
+            if (cma.sigma < 1e-8f || stagnationCount >= stagnationLimit)
+            {
+                ++restartsUsed;
+                stagnationCount = 0;
+
+                for (int i = 0; i < A; ++i)
                 {
-                    runDEGeneration (pop, fitness, F_vec, CR_vec, activeParams,
-                                     mins, maxs, bestIdx, refDesc, sampleRate, rng, uni,
-                                     (float) globalIter / (float) totalReportIters);
-
-                    ++globalIter;
-                    result.iterations = globalIter;
-                    result.bestDistance = fitness[bestIdx];
-
-                    if (progress && ! progress (globalIter, fitness[bestIdx], totalReportIters))
-                        break;
-
-                    if (fitness[bestIdx] < targetDistance)
-                    {
-                        result.converged = true;
-                        break;
-                    }
-
-                    float improvement = prevBest - fitness[bestIdx];
-                    if (improvement < improvementEpsilon) ++stagnationCount;
-                    else stagnationCount = 0;
-                    prevBest = fitness[bestIdx];
-
-                    if (stagnationCount >= stagnationLimit)
-                    {
-                        if (restartsUsed < maxRestarts)
-                        {
-                            partialRestart();
-                            ++restartsUsed;
-                        }
-                        else
-                            break;
-                    }
+                    int j = activeParams[i];
+                    float range = subMaxs[i] - subMins[i];
+                    normMean[i] = (range > 1e-10f) ? (bestVec[j] - subMins[i]) / range : 0.5f;
                 }
+                float restartSigma = std::max (0.03f, 0.20f / (float)(restartsUsed));
+                cma.init (A, normMean, restartSigma);
             }
         }
 
-        // === GAP ANALYSIS #2 — re-analyze on current best, activate more extensions ===
-        if (! result.converged)
+        result.phase1Iterations = result.cmaGenerations;
+        result.phase1Distance = bestFitness;
+
+        // === STEP 6: Sensitivity analysis on active params ===
+        for (int j : activeParams)
         {
-            MatchSynthParams bestP2;
-            bestP2.fromArray (pop[bestIdx].data());
-            auto bestBuffer2 = synth.generate (bestP2, sampleRate);
-            extractor.setFastMode (true);
-            auto matchedDesc2 = extractor.extract (bestBuffer2, sampleRate);
-            extractor.setFastMode (false);
-
-            auto gaps2 = analyzeGaps (refDesc, matchedDesc2);
-
-            // Merge gap flags (OR with previous)
-            result.gaps.merge (gaps2);
-
-            // Find NEW extension indices not already in activeParams
-            auto newExtIndices = gaps2.getExtensionIndices();
-            std::vector<int> newlyAdded;
-
-            for (int idx : newExtIndices)
-            {
-                bool alreadyActive = false;
-                for (int a : activeParams)
-                    if (a == idx) { alreadyActive = true; break; }
-                if (! alreadyActive)
-                {
-                    activeParams.push_back (idx);
-                    newlyAdded.push_back (idx);
-                }
-            }
-
-            result.extensionsActivated = result.gaps.extensionCount();
-
-            if (! newlyAdded.empty())
-            {
-                // Initialize newly added extension params in population
-                for (int idx : newlyAdded)
-                {
-                    int gateIdx = MatchSynthParams::getExtensionGateIndex (idx);
-                    if (idx == gateIdx)
-                        pop[bestIdx][idx] = 0.3f;
-                }
-
-                // Perturb rest of population's newly added extension params
-                for (int i = 0; i < popSize; ++i)
-                {
-                    if (i == bestIdx) continue;
-                    for (int idx : newlyAdded)
-                    {
-                        float range = maxs[idx] - mins[idx];
-                        pop[i][idx] = mins[idx] + uni (rng) * range;
-                    }
-                    fitness[i] = evaluate (pop[i].data(), refDesc, sampleRate);
-                }
-
-                // Update best
-                for (int i = 0; i < popSize; ++i)
-                    if (fitness[i] < fitness[bestIdx]) bestIdx = i;
-            }
-
-            // Reset stagnation for phase 3
-            stagnationCount = 0;
-            prevBest = fitness[bestIdx];
-
-            // === PHASE 3: DE on all active params (20% budget) ===
-            restartsUsed = 0;
-            for (int iter = 0; iter < phase3Iters; ++iter)
-            {
-                runDEGeneration (pop, fitness, F_vec, CR_vec, activeParams,
-                                 mins, maxs, bestIdx, refDesc, sampleRate, rng, uni,
-                                 (float) globalIter / (float) totalReportIters);
-
-                ++globalIter;
-                result.iterations = globalIter;
-                result.bestDistance = fitness[bestIdx];
-
-                if (progress && ! progress (globalIter, fitness[bestIdx], totalReportIters))
-                    break;
-
-                if (fitness[bestIdx] < targetDistance)
-                {
-                    result.converged = true;
-                    break;
-                }
-
-                float improvement = prevBest - fitness[bestIdx];
-                if (improvement < improvementEpsilon) ++stagnationCount;
-                else stagnationCount = 0;
-                prevBest = fitness[bestIdx];
-
-                if (stagnationCount >= stagnationLimit)
-                {
-                    if (restartsUsed < maxRestarts)
-                    {
-                        partialRestart();
-                        ++restartsUsed;
-                    }
-                    else
-                        break;
-                }
-            }
-        }
-
-        // === PHASE 4: Sensitivity analysis ===
-        auto bestVec = pop[bestIdx];
-        float bestFit = fitness[bestIdx];
-
-        for (int j = 0; j < N; ++j)
-        {
-            // Only analyze active params
-            bool isActive = false;
-            for (int a : activeParams)
-                if (a == j) { isActive = true; break; }
-            if (! isActive) { result.sensitivity[j] = 0.0f; continue; }
-
             float range = maxs[j] - mins[j];
-            float step = range * 0.02f;
+            if (range < 1e-10f) { result.sensitivity[j] = 0.0f; continue; }
 
-            std::vector<float> testVec = bestVec;
+            float step = range * 0.02f;
+            auto testVec = bestVec;
+
             testVec[j] = std::max (mins[j], std::min (maxs[j], bestVec[j] + step));
-            if (j == 0) testVec[0] = std::max (0.0f, std::min ((float) maxOscType, std::round (testVec[0])));
-            float fitPlus = evaluate (testVec.data(), refDesc, sampleRate, true);
+            if (j == 0) testVec[0] = std::round (std::max (0.0f, std::min ((float) maxOscType, testVec[0])));
+            float fitPlus = evaluate (testVec.data(), sampleRate);
 
             testVec[j] = std::max (mins[j], std::min (maxs[j], bestVec[j] - step));
-            if (j == 0) testVec[0] = std::max (0.0f, std::min ((float) maxOscType, std::round (testVec[0])));
-            float fitMinus = evaluate (testVec.data(), refDesc, sampleRate, true);
+            if (j == 0) testVec[0] = std::round (std::max (0.0f, std::min ((float) maxOscType, testVec[0])));
+            float fitMinus = evaluate (testVec.data(), sampleRate);
 
-            float sensitivity = std::abs (fitPlus - bestFit) + std::abs (fitMinus - bestFit);
-            result.sensitivity[j] = sensitivity;
+            result.sensitivity[j] = std::abs (fitPlus - bestFitness) + std::abs (fitMinus - bestFitness);
         }
 
-        // Normalize sensitivity
         float maxSens = *std::max_element (result.sensitivity.begin(), result.sensitivity.end());
         if (maxSens > 0.0f)
             for (auto& s : result.sensitivity) s /= maxSens;
 
-        // === Nelder-Mead on sensitive active params ===
-        std::vector<int> nmParams;
-        for (int j : activeParams)
-            if (result.sensitivity[j] > 0.1f)
-                nmParams.push_back (j);
-
-        if (! nmParams.empty())
+        // === STEP 7: Multiple rounds of NM polish ===
         {
-            auto refined = nelderMeadRefine (bestVec, nmParams, mins, maxs, refDesc, sampleRate);
-            // Compare using same metric (descriptor-only) to decide if NM improved
-            float refinedDescDist = evaluate (refined.data(), refDesc, sampleRate, false);
+            std::vector<int> nmParams;
+            for (int j : activeParams)
+                if (result.sensitivity[j] > 0.01f)
+                    nmParams.push_back (j);
 
-            if (refinedDescDist < bestFit)
+            // 5 rounds of NM polish — squeeze every last bit of improvement
+            MatchDescriptors dummyRef;
+            for (int round = 0; round < 5 && ! nmParams.empty(); ++round)
             {
-                bestVec = refined;
-                bestFit = refinedDescDist;
+                auto refined = nelderMeadRefine (bestVec, nmParams, mins, maxs, dummyRef, sampleRate);
+                float refinedFit = evaluate (refined.data(), sampleRate);
+                if (refinedFit < bestFitness)
+                {
+                    bestVec = refined;
+                    bestFitness = refinedFit;
+                }
+                else break; // no improvement, stop polishing
             }
         }
 
-        result.bestDistance = bestFit;
+        result.bestDistance = bestFitness;
         result.bestParams.fromArray (bestVec.data());
+
+        // === STEP 8: Compute detailed metrics for reporting ===
+        {
+            MatchSynthParams finalP;
+            finalP.fromArray (bestVec.data());
+            configureSynth();
+            auto finalBuf = synth.generate (finalP, sampleRate);
+
+            // Descriptor distance for reporting
+            extractor.setFastMode (true);
+            auto finalDesc = extractor.extract (finalBuf, sampleRate);
+            extractor.setFastMode (false);
+            if (finalDesc.valid)
+                result.descDistance = computeCoreLoss (refDescFull, finalDesc);
+
+            // STFT distance for reporting
+            if (refMonoReady)
+                result.stftDistance = multiResSTFTLoss (finalBuf);
+
+            // Detailed spectral metrics
+            if (refMonoReady)
+            {
+                int genLen = finalBuf.getNumSamples();
+                std::vector<float> genMono (genLen, 0.0f);
+                for (int ch = 0; ch < finalBuf.getNumChannels(); ++ch)
+                {
+                    const float* data = finalBuf.getReadPointer (ch);
+                    for (int i = 0; i < genLen; ++i) genMono[i] += data[i];
+                }
+                float chScale = 1.0f / (float) finalBuf.getNumChannels();
+                for (auto& s : genMono) s *= chScale;
+
+                result.melLoss = computeMelSpectrogramLoss (refMono, genMono, (float) sampleRate);
+                result.envCorrelation = computeEnvelopeCorrelation (refMono, genMono, (float) sampleRate);
+                result.pitchContourLoss = computePitchContourLoss (refMono, genMono, (float) sampleRate, refHNR);
+            }
+        }
+
         if (result.bestDistance < targetDistance)
             result.converged = true;
 
@@ -893,18 +912,23 @@ public:
     void setHarmonicPhases (const HarmonicPhaseData* hp) { harmonicPhases = hp; }
     void setLearnedProfile (const LearnedProfile* lp) { learnedProfile = lp; }
 
-private:
-    int   maxIterations  = 150;
-    float targetDistance  = 1.5f;
-    int   popSize        = 40;
-    int   maxOscType     = 11;
+    InstrumentType getDetectedType() const { return detectedType; }
 
-    OneShotMatchSynth synth;
+private:
+    int   maxGenerations  = 1500;   // enough budget for convergence (~30K evals, ~5-8 min)
+    float targetDistance   = 0.05f;  // 90% score = exp(-0.05*2) = 0.905
+    int   popSizeHint     = 20;
+    int   maxOscType      = 11;
+
+    universalsynth::UniversalSynth synth;
     DescriptorExtractor extractor;
 
     const juce::AudioBuffer<float>* refBuffer = nullptr;
     std::vector<float> refMono;
     bool refMonoReady = false;
+    float refHNR = 0.0f;
+    InstrumentType detectedType = InstrumentType::Unknown;
+
     const WavetableData* wavetable = nullptr;
     const ResidualNoiseData* residualNoise = nullptr;
     const TransientSampleData* transientSample = nullptr;
@@ -921,12 +945,10 @@ private:
         synth.setHarmonicPhases (harmonicPhases);
     }
 
-    // Prepare reference mono at optSR — called once before optimization loop
     void prepareRefMono (double optSR, double origSR)
     {
         if (refBuffer == nullptr || refBuffer->getNumSamples() == 0) return;
 
-        // Mix to mono
         int origLen = refBuffer->getNumSamples();
         std::vector<float> monoOrig (origLen, 0.0f);
         for (int ch = 0; ch < refBuffer->getNumChannels(); ++ch)
@@ -938,7 +960,6 @@ private:
         float scale = 1.0f / (float) refBuffer->getNumChannels();
         for (auto& s : monoOrig) s *= scale;
 
-        // Resample to optSR
         double ratio = optSR / origSR;
         int newLen = (int)(origLen * ratio);
         refMono.resize (newLen);
@@ -953,13 +974,11 @@ private:
         refMonoReady = true;
     }
 
-    // Multi-resolution STFT loss: compare log-magnitude spectra at 3 resolutions
-    // This is the gold standard for audio matching (used in DDSP, neural synths, etc.)
+    // Multi-resolution STFT loss (kept for reporting)
     float multiResSTFTLoss (const juce::AudioBuffer<float>& gen) const
     {
         if (! refMonoReady || refMono.empty()) return 0.0f;
 
-        // Mix generated to mono
         int genLen = gen.getNumSamples();
         int compareLen = std::min ((int) refMono.size(), genLen);
         if (compareLen < 256) return 100.0f;
@@ -974,11 +993,26 @@ private:
         float chScale = 1.0f / (float) gen.getNumChannels();
         for (auto& s : genMono) s *= chScale;
 
-        float totalLoss = 0.0f;
+        {
+            float refRMS = 0.0f, genRMS = 0.0f;
+            for (int i = 0; i < compareLen; ++i)
+            {
+                refRMS += refMono[i] * refMono[i];
+                genRMS += genMono[i] * genMono[i];
+            }
+            refRMS = std::sqrt (refRMS / (float) compareLen);
+            genRMS = std::sqrt (genRMS / (float) compareLen);
+            if (genRMS > 1e-8f && refRMS > 1e-8f)
+            {
+                float gainCorrection = refRMS / genRMS;
+                for (int i = 0; i < genLen; ++i)
+                    genMono[i] *= gainCorrection;
+            }
+        }
 
-        // 3 resolutions: 256, 1024, 2048 samples
+        float totalLoss = 0.0f;
         static constexpr int NUM_RES = 3;
-        static constexpr int fftOrders[NUM_RES] = { 8, 10, 11 };  // 256, 1024, 2048
+        static constexpr int fftOrders[NUM_RES] = { 8, 10, 11 };
         static constexpr float resWeights[NUM_RES] = { 0.25f, 0.5f, 0.25f };
 
         for (int r = 0; r < NUM_RES; ++r)
@@ -992,10 +1026,9 @@ private:
             juce::dsp::FFT fft (fftOrders[r]);
 
             int numFrames = std::max (1, (compareLen - fftSize) / hopSize + 1);
-            numFrames = std::min (numFrames, 16); // cap at 16 frames for speed
+            numFrames = std::min (numFrames, 12);
 
-            float specLoss = 0.0f;  // spectral convergence (log-mag L1)
-            float magLoss = 0.0f;   // log-mag L1 distance
+            float magLoss = 0.0f;
             int totalBins = 0;
 
             for (int frame = 0; frame < numFrames; ++frame)
@@ -1003,7 +1036,6 @@ private:
                 int start = frame * hopSize;
                 if (start + fftSize > compareLen) break;
 
-                // Hann window + FFT for both signals
                 std::vector<float> refFFT (fftSize * 2, 0.0f);
                 std::vector<float> genFFT (fftSize * 2, 0.0f);
 
@@ -1017,8 +1049,7 @@ private:
                 fft.performRealOnlyForwardTransform (refFFT.data());
                 fft.performRealOnlyForwardTransform (genFFT.data());
 
-                // Compare log magnitudes
-                for (int b = 1; b < numBins; ++b) // skip DC
+                for (int b = 1; b < numBins; ++b)
                 {
                     float refMag = std::sqrt (refFFT[b * 2] * refFFT[b * 2] + refFFT[b * 2 + 1] * refFFT[b * 2 + 1]);
                     float genMag = std::sqrt (genFFT[b * 2] * genFFT[b * 2] + genFFT[b * 2 + 1] * genFFT[b * 2 + 1]);
@@ -1038,131 +1069,173 @@ private:
         return totalLoss;
     }
 
-    float evaluate (const float* paramArray, const MatchDescriptors& ref, double sampleRate,
-                    bool /*useSTFT*/ = false)
+    // Build an initial guess from descriptors + instrument type
+    // All params are starting points for CMA-ES (not locked)
+    MatchSynthParams descriptorGuess (const MatchDescriptors& d, InstrumentType type) const
+    {
+        MatchSynthParams g;
+
+        // Structural params — best guess from descriptors
+        g.basePitch = (d.fundamentalFreq > 20.0f) ? d.fundamentalFreq : 50.0f;
+        g.duration = std::max (0.05f, std::min (3.0f, d.totalDuration));
+        g.masterGain = std::max (0.7f, std::min (1.0f, d.rmsLoudness / 0.45f));
+
+        if (wavetable != nullptr && wavetable->valid)
+            g.oscType = 12;
+        else
+            g.oscType = 0;
+
+        // Pitch envelope
+        g.pitchEnvDepth = std::max (0.0f, d.pitchDropSemitones);
+        g.pitchEnvFast = std::max (0.0003f, std::min (0.01f, d.pitchDropTime * 0.15f));
+        g.pitchEnvSlow = std::max (0.003f, d.pitchDropTime);
+        g.pitchEnvBalance = (d.pitchDropSemitones > 12.0f) ? 0.85f : 0.5f;
+
+        // Amplitude envelope
+        g.ampAttack = std::max (0.0001f, std::min (0.05f, d.attackTime));
+        g.ampPunchDecay = std::max (0.005f, std::min (0.5f, d.decayTime * 0.5f));
+        g.ampBodyDecay = std::max (0.02f, d.decayTime);
+        g.ampPunchLevel = std::max (0.3f, std::min (0.9f, d.transientStrength / 8.0f + 0.3f));
+        g.envRelease = std::max (0.01f, std::min (1.0f, (d.totalDuration - d.decayTime) * 0.5f));
+        g.envCurve = std::max (0.5f, std::min (3.0f, d.envelopeShape * 2.0f + 0.5f));
+        g.envSustainLevel = 0.0f;
+        g.envSustainTime = 0.0f;
+
+        // Filter
+        g.filterCutoff = std::max (500.0f, std::min (20000.0f, d.spectralRolloff * 2.5f));
+        g.filterReso = 0.0f;
+
+        // Layer gates
+        switch (type)
+        {
+            case InstrumentType::Kick:
+            case InstrumentType::Bass:
+                g.tonalLevel = 0.9f;
+                g.noiseLevel = 0.0f;
+                g.modalLevel = 0.0f;
+                g.transientLevel = (type == InstrumentType::Kick) ? std::min (0.6f, d.transientStrength / 5.0f) : 0.0f;
+                g.subLevel = std::max (0.3f, d.subEnergy * 1.5f);
+                break;
+
+            case InstrumentType::Snare:
+                g.tonalLevel = 0.5f;
+                g.noiseLevel = 0.5f;
+                g.modalLevel = 0.0f;
+                g.transientLevel = std::min (0.5f, d.transientStrength / 6.0f);
+                break;
+
+            case InstrumentType::HiHat:
+                g.tonalLevel = 0.0f;
+                g.noiseLevel = 0.4f;
+                g.modalLevel = 0.6f;
+                g.transientLevel = 0.3f;
+                g.modeSpread = 0.6f;
+                g.numModes = 8.0f;
+                break;
+
+            case InstrumentType::Clap:
+                g.tonalLevel = 0.1f;
+                g.noiseLevel = 0.7f;
+                g.modalLevel = 0.0f;
+                g.transientLevel = 0.2f;
+                g.burstCount = 4.0f;
+                g.burstSpacing = 0.01f;
+                break;
+
+            case InstrumentType::Perc:
+                g.tonalLevel = 0.4f;
+                g.noiseLevel = 0.2f;
+                g.modalLevel = 0.3f;
+                g.transientLevel = 0.3f;
+                break;
+
+            case InstrumentType::Lead:
+                g.tonalLevel = 0.8f;
+                g.noiseLevel = 0.0f;
+                g.modalLevel = 0.0f;
+                g.transientLevel = 0.1f;
+                break;
+
+            case InstrumentType::Pad:
+            case InstrumentType::Texture:
+                g.tonalLevel = (type == InstrumentType::Pad) ? 0.6f : 0.3f;
+                g.noiseLevel = 0.3f;
+                g.modalLevel = 0.1f;
+                g.transientLevel = 0.0f;
+                g.envSustainLevel = 0.3f;
+                g.envSustainTime = std::max (0.1f, d.totalDuration * 0.3f);
+                break;
+
+            default:
+                g.tonalLevel = std::max (0.3f, std::min (1.0f, (d.subEnergy + d.lowMidEnergy) * 2.0f));
+                g.noiseLevel = (d.harmonicNoiseRatio < 0.5f) ? 0.3f : 0.0f;
+                g.transientLevel = std::min (0.5f, d.transientStrength / 6.0f);
+                break;
+        }
+
+        // Timbral starting points
+        g.bodyHarmonics = (d.fundamentalFreq > 20.0f)
+            ? std::min (0.5f, (d.harmonicProfile[1] + d.harmonicProfile[2]) * 0.4f) : 0.0f;
+
+        g.clickFreq = std::max (2000.0f, d.transientRegion.spectralCentroid);
+        g.clickDecay = std::max (0.0003f, std::min (0.005f, d.attackTime * 0.3f));
+        g.topNoise = std::min (0.3f, d.highEnergy * 3.0f);
+
+        if (g.noiseLevel > 0.01f)
+        {
+            g.noiseColor = 0.5f;
+            g.noiseDecay = std::max (0.01f, d.decayTime * 0.8f);
+            g.noiseFilterFreq = std::min (12000.0f, std::max (500.0f, d.noiseSpectralCentroid));
+        }
+
+        g.satAmount = (d.harmonicNoiseRatio > 0.5f) ? 0.15f : 0.0f;
+
+        if (residualNoise != nullptr && residualNoise->valid) g.residualAmt = 0.3f;
+        if (transientSample != nullptr && transientSample->valid) g.transientSampleAmt = 0.4f;
+
+        return g;
+    }
+
+    // Evaluate a candidate using spectral match loss (PRIMARY)
+    float evaluate (const float* paramArray, double sampleRate)
     {
         MatchSynthParams p;
         p.fromArray (paramArray);
         configureSynth();
+
         auto buffer = synth.generate (p, sampleRate);
-        // Check for empty/NaN buffer
+
+        // Check for silent/NaN buffer
         {
             float peak = buffer.getMagnitude (0, 0, buffer.getNumSamples());
             if (peak < 1e-8f || std::isnan (peak) || std::isinf (peak))
                 return 1e6f;
         }
 
-        // PRIMARY: direct spectral comparison — this is the ground truth
-        float stftLoss = 0.0f;
-        if (refMonoReady)
-            stftLoss = multiResSTFTLoss (buffer);
+        if (! refMonoReady) return 1e6f;
 
-        // SECONDARY: fast descriptor distance for structural guidance (pitch, envelope)
-        extractor.setFastMode (true);
-        auto genDesc = extractor.extract (buffer, sampleRate);
-        extractor.setFastMode (false);
-        if (! genDesc.valid) return 1e6f;
-
-        DistanceWeights dw;
-        if (learnedProfile != nullptr && learnedProfile->valid)
+        // Convert to mono
+        int genLen = buffer.getNumSamples();
+        std::vector<float> genMono (genLen, 0.0f);
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
         {
-            dw.envelope = learnedProfile->envWeight;
-            dw.pitch = learnedProfile->pitchWeight;
-            dw.spectral = learnedProfile->spectralWeight;
-            dw.sub = learnedProfile->subWeight;
-            dw.transient = learnedProfile->transientWeight;
-            dw.spectroTemporal = learnedProfile->spectroTemporalWeight;
+            const float* data = buffer.getReadPointer (ch);
+            for (int i = 0; i < genLen; ++i) genMono[i] += data[i];
         }
-        float descDist = computeDistance (ref, genDesc, dw);
+        float chScale = 1.0f / (float) buffer.getNumChannels();
+        for (auto& s : genMono) s *= chScale;
 
-        // Hybrid: STFT is primary (matches actual audio), descriptors guide structure
-        if (refMonoReady)
-            return stftLoss * 2.0f + descDist * 0.3f;
-
-        return descDist;
-    }
-
-    // Run one generation of DE on the active param subset
-    // progressRatio: 0..1 indicating how far through the total budget we are
-    void runDEGeneration (std::vector<std::vector<float>>& pop,
-                          std::vector<float>& fitness,
-                          std::vector<float>& F_vec,
-                          std::vector<float>& CR_vec,
-                          const std::vector<int>& activeParams,
-                          const float* mins, const float* maxs,
-                          int& bestIdx,
-                          const MatchDescriptors& refDesc,
-                          double sampleRate,
-                          std::mt19937& rng,
-                          std::uniform_real_distribution<float>& uni,
-                          float progressRatio = 0.5f)
-    {
-        const int PS = (int) pop.size();
-        const int A = (int) activeParams.size();
-
-        // Greediness ramps from 0.3 (exploration) to 1.0 (exploitation)
-        float greediness = 0.3f + 0.7f * progressRatio;
-
-        for (int i = 0; i < PS; ++i)
-        {
-            // jDE self-adaptation
-            float Fi  = (uni (rng) < 0.1f) ? 0.1f + 0.9f * uni (rng) : F_vec[i];
-            float CRi = (uni (rng) < 0.1f) ? uni (rng) : CR_vec[i];
-
-            // DE/current-to-best/1 hybrid
-            // Early: more exploration (current + small step toward best)
-            // Late: more exploitation (nearly pure best/1)
-            int r1, r2;
-            do { r1 = rng() % PS; } while (r1 == i);
-            do { r2 = rng() % PS; } while (r2 == i || r2 == r1);
-
-            auto trial = pop[i]; // copy all (keeps inactive params)
-            int jrand = rng() % A;
-
-            for (int k = 0; k < A; ++k)
-            {
-                int j = activeParams[k];
-                if (uni (rng) < CRi || k == jrand)
-                {
-                    // Blend: current + greediness * (best - current) + F * (r1 - r2)
-                    trial[j] = pop[i][j]
-                             + greediness * Fi * (pop[bestIdx][j] - pop[i][j])
-                             + Fi * (pop[r1][j] - pop[r2][j]);
-                }
-
-                trial[j] = std::max (mins[j], std::min (maxs[j], trial[j]));
-            }
-            // Discrete params: occasionally try a random type instead of continuous mutation
-            if (uni (rng) < 0.1f)
-                trial[0] = (float) (rng() % (maxOscType + 1));
-            trial[0] = std::max (0.0f, std::min ((float) maxOscType, std::round (trial[0])));
-            // clickType (0-3), masterSatType (0-2) — discrete
-            trial[97] = std::max (0.0f, std::min (3.0f, std::round (trial[97])));
-            trial[99] = std::max (0.0f, std::min (2.0f, std::round (trial[99])));
-
-            float trialFit = evaluate (trial.data(), refDesc, sampleRate);
-
-            if (trialFit <= fitness[i])
-            {
-                pop[i] = trial;
-                fitness[i] = trialFit;
-                F_vec[i] = Fi;
-                CR_vec[i] = CRi;
-
-                if (trialFit < fitness[bestIdx])
-                    bestIdx = i;
-            }
-        }
+        return computeSpectralMatchLoss (refMono, genMono, (float) sampleRate, refHNR);
     }
 
     // Nelder-Mead on a subset of active parameters
     std::vector<float> nelderMeadRefine (const std::vector<float>& start,
                                           const std::vector<int>& activeParams,
                                           const float* mins, const float* maxs,
-                                          const MatchDescriptors& ref, double sampleRate)
+                                          const MatchDescriptors& /*ref*/, double sampleRate)
     {
         const int M = (int) activeParams.size();
-        const int maxNMIter = 30;
+        const int maxNMIter = 80;
 
         auto inject = [&](const std::vector<float>& base, const std::vector<float>& subVec) -> std::vector<float>
         {
@@ -1170,8 +1243,8 @@ private:
             for (int i = 0; i < M; ++i)
                 full[activeParams[i]] = subVec[i];
             full[0] = std::max (0.0f, std::min ((float) maxOscType, std::round (full[0])));
-            full[97] = std::max (0.0f, std::min (3.0f, std::round (full[97])));
-            full[99] = std::max (0.0f, std::min (2.0f, std::round (full[99])));
+            full[59] = std::max (0.0f, std::min (3.0f, std::round (full[59])));
+            full[86] = std::max (0.0f, std::min (2.0f, std::round (full[86])));
             return full;
         };
 
@@ -1199,14 +1272,14 @@ private:
         {
             int pi = activeParams[i - 1];
             float range = maxs[pi] - mins[pi];
-            simplex[i][i - 1] += range * 0.03f;
+            simplex[i][i - 1] += range * 0.05f;
             clampSub (simplex[i]);
         }
 
         for (int i = 0; i <= M; ++i)
         {
             auto full = inject (start, simplex[i]);
-            fvals[i] = evaluate (full.data(), ref, sampleRate, true);
+            fvals[i] = evaluate (full.data(), sampleRate);
         }
 
         for (int iter = 0; iter < maxNMIter; ++iter)
@@ -1234,7 +1307,7 @@ private:
             clampSub (reflected);
 
             auto fullR = inject (start, reflected);
-            float fr = evaluate (fullR.data(), ref, sampleRate, true);
+            float fr = evaluate (fullR.data(), sampleRate);
 
             if (fr < fvals[0])
             {
@@ -1243,7 +1316,7 @@ private:
                     expanded[j] = centroid[j] + 2.0f * (reflected[j] - centroid[j]);
                 clampSub (expanded);
                 auto fullE = inject (start, expanded);
-                float fe = evaluate (fullE.data(), ref, sampleRate, true);
+                float fe = evaluate (fullE.data(), sampleRate);
                 simplex[M] = (fe < fr) ? expanded : reflected;
                 fvals[M] = std::min (fe, fr);
             }
@@ -1259,7 +1332,7 @@ private:
                     contracted[j] = centroid[j] + 0.5f * (simplex[M][j] - centroid[j]);
                 clampSub (contracted);
                 auto fullC = inject (start, contracted);
-                float fc = evaluate (fullC.data(), ref, sampleRate, true);
+                float fc = evaluate (fullC.data(), sampleRate);
 
                 if (fc < fvals[M])
                 {
@@ -1274,7 +1347,7 @@ private:
                             simplex[i][j] = simplex[0][j] + 0.5f * (simplex[i][j] - simplex[0][j]);
                         clampSub (simplex[i]);
                         auto fullS = inject (start, simplex[i]);
-                        fvals[i] = evaluate (fullS.data(), ref, sampleRate, true);
+                        fvals[i] = evaluate (fullS.data(), sampleRate);
                     }
                 }
             }

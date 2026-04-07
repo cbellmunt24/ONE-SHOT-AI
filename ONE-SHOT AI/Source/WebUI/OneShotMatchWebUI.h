@@ -214,12 +214,11 @@ static const char* getHTML()
             </div>
         </div>
 
-        <!-- Extensions activated -->
+        <!-- Spectral Match Quality -->
         <div class="section" id="kmExtSection" style="display:none">
             <div class="km-extensions">
-                <div class="km-ext-title">Self-Improving Synth Extensions</div>
-                <div class="km-ext-chips" id="kmExtChips"></div>
-                <div class="km-ext-phase-info" id="kmExtPhaseInfo"></div>
+                <div class="km-ext-title">Spectral Match Quality</div>
+                <div id="kmSpectralInfo" style="font-size:11px; color:var(--text2); line-height:1.6;"></div>
             </div>
         </div>
 
@@ -418,8 +417,7 @@ static const char* getJS2()
     var kmDescCompare = document.getElementById('kmDescCompare');
     var kmDescCompareSection = document.getElementById('kmDescCompareSection');
     var kmExtSection = document.getElementById('kmExtSection');
-    var kmExtChips = document.getElementById('kmExtChips');
-    var kmExtPhaseInfo = document.getElementById('kmExtPhaseInfo');
+    var kmSpectralInfo = document.getElementById('kmSpectralInfo');
     var kmParamsGrid = document.getElementById('kmParamsGrid');
     var kmPlayRef = document.getElementById('kmPlayRef');
     var kmPlayMatch = document.getElementById('kmPlayMatch');
@@ -431,85 +429,111 @@ static const char* getJS2()
     var kmMatchAudio = null;
     var kmPollTimer = null;
 
-    var paramInfo = [
-        {name:'oscType',         unit:'',   fmt:0, ext:false},
-        {name:'basePitch',       unit:'Hz', fmt:1, ext:false},
-        {name:'bodyHarmonics',   unit:'',   fmt:3, ext:false},
-        {name:'pitchEnvDepth',   unit:'st', fmt:1, ext:false},
-        {name:'pitchEnvFast',    unit:'s',  fmt:4, ext:false},
-        {name:'pitchEnvSlow',    unit:'s',  fmt:3, ext:false},
-        {name:'pitchEnvBalance', unit:'',   fmt:2, ext:false},
-        {name:'ampAttack',       unit:'s',  fmt:4, ext:false},
-        {name:'ampPunchDecay',   unit:'s',  fmt:3, ext:false},
-        {name:'ampBodyDecay',    unit:'s',  fmt:3, ext:false},
-        {name:'ampPunchLevel',   unit:'',   fmt:2, ext:false},
-        {name:'subLevel',        unit:'',   fmt:2, ext:false},
-        {name:'subTailDecay',    unit:'s',  fmt:3, ext:false},
-        {name:'subDetune',       unit:'Hz', fmt:2, ext:false},
-        {name:'clickAmount',     unit:'',   fmt:3, ext:false},
-        {name:'clickFreq',       unit:'Hz', fmt:0, ext:false},
-        {name:'clickWidth',      unit:'',   fmt:2, ext:false},
-        {name:'clickDecay',      unit:'s',  fmt:4, ext:false},
-        {name:'distortion',      unit:'',   fmt:3, ext:false},
-        {name:'noiseAmount',     unit:'',   fmt:3, ext:false},
-        {name:'filterCutoff',    unit:'Hz', fmt:0, ext:false},
-        {name:'harmonicEmphasis',unit:'',   fmt:3, ext:false},
-        {name:'fmDepth',         unit:'',   fmt:3, ext:true},
-        {name:'fmRatio',         unit:'',   fmt:2, ext:true},
-        {name:'fmDecay',         unit:'s',  fmt:3, ext:true},
-        {name:'bodyResonance',   unit:'',   fmt:3, ext:true},
-        {name:'bodyResonFreq',   unit:'Hz', fmt:0, ext:true},
-        {name:'pitchWobble',     unit:'',   fmt:3, ext:true},
-        {name:'wobbleRate',      unit:'Hz', fmt:1, ext:true},
-        {name:'wobbleDecay',     unit:'s',  fmt:3, ext:true},
-        {name:'transientSnap',   unit:'',   fmt:3, ext:true},
-        {name:'transientHold',   unit:'s',  fmt:4, ext:true},
-        {name:'combAmount',      unit:'',   fmt:3, ext:true},
-        {name:'combFreq',        unit:'Hz', fmt:0, ext:true},
-        {name:'combFeedback',    unit:'',   fmt:2, ext:true},
-        {name:'lowSaturation',   unit:'',   fmt:3, ext:true},
-        {name:'highSaturation',  unit:'',   fmt:3, ext:true},
-        {name:'phaseDistort',    unit:'',   fmt:3, ext:true},
-        {name:'phaseDistDecay',  unit:'s',  fmt:3, ext:true},
-        // v2 extensions
-        {name:'additiveAmt',    unit:'',   fmt:3, ext:true},
-        {name:'harmonic2',      unit:'',   fmt:3, ext:true},
-        {name:'harmonic3',      unit:'',   fmt:3, ext:true},
-        {name:'harmonic4',      unit:'',   fmt:3, ext:true},
-        {name:'harmonicDecayRate',unit:'', fmt:2, ext:true},
-        {name:'inharmonicity',  unit:'',   fmt:4, ext:true},
-        {name:'reson2Amt',      unit:'',   fmt:3, ext:true},
-        {name:'reson2Freq',     unit:'Hz', fmt:0, ext:true},
-        {name:'reson3Amt',      unit:'',   fmt:3, ext:true},
-        {name:'reson3Freq',     unit:'Hz', fmt:0, ext:true},
-        {name:'noiseShapeAmt',  unit:'',   fmt:3, ext:true},
-        {name:'noiseColor',     unit:'',   fmt:2, ext:true},
-        {name:'noiseFilterFreq',unit:'Hz', fmt:0, ext:true},
-        {name:'noiseFilterQ',   unit:'',   fmt:2, ext:true},
-        {name:'eqAmount',       unit:'',   fmt:3, ext:true},
-        {name:'eqLowGain',     unit:'dB', fmt:1, ext:true},
-        {name:'eqMidGain',     unit:'dB', fmt:1, ext:true},
-        {name:'eqMidFreq',     unit:'Hz', fmt:0, ext:true},
-        {name:'eqHighGain',    unit:'dB', fmt:1, ext:true},
-        {name:'envSustainLevel',unit:'',   fmt:3, ext:true},
-        {name:'envSustainTime', unit:'s',  fmt:3, ext:true},
-        {name:'envRelease',     unit:'s',  fmt:3, ext:true},
-        {name:'envCurve',       unit:'',   fmt:2, ext:true},
-        {name:'stereoWidth',    unit:'',   fmt:3, ext:true},
-        {name:'stereoFreq',     unit:'Hz', fmt:0, ext:true},
-        // v3 extensions
-        {name:'unisonAmt',     unit:'',   fmt:3, ext:true},
-        {name:'unisonDetune',  unit:'ct', fmt:1, ext:true},
-        {name:'unisonSpread',  unit:'',   fmt:2, ext:true},
-        {name:'formantAmt',    unit:'',   fmt:3, ext:true},
-        {name:'formantFreq1',  unit:'Hz', fmt:0, ext:true},
-        {name:'formantFreq2',  unit:'Hz', fmt:0, ext:true},
-        {name:'transLayerAmt', unit:'',   fmt:3, ext:true},
-        {name:'transLayerFreq',unit:'Hz', fmt:0, ext:true},
-        {name:'transLayerDecay',unit:'s', fmt:4, ext:true},
-        {name:'reverbAmt',     unit:'',   fmt:3, ext:true},
-        {name:'reverbDecay',   unit:'s',  fmt:3, ext:true},
-        {name:'reverbDamp',    unit:'',   fmt:2, ext:true}
+    var paramGroups = [
+        {group:'Global', params:[
+            {name:'oscType',         unit:'',   fmt:0},
+            {name:'basePitch',       unit:'Hz', fmt:1},
+            {name:'duration',        unit:'s',  fmt:3},
+            {name:'masterGain',      unit:'',   fmt:3}
+        ]},
+        {group:'Pitch', params:[
+            {name:'pitchEnvDepth',   unit:'st', fmt:1},
+            {name:'pitchEnvFast',    unit:'s',  fmt:4},
+            {name:'pitchEnvSlow',    unit:'s',  fmt:3},
+            {name:'pitchEnvBalance', unit:'',   fmt:2},
+            {name:'pitchHoldTime',   unit:'s',  fmt:4},
+            {name:'pitchBounce',     unit:'',   fmt:3},
+            {name:'pitchWobble',     unit:'',   fmt:3},
+            {name:'wobbleRate',      unit:'Hz', fmt:1}
+        ]},
+        {group:'Layer A \u2014 Tonal', params:[
+            {name:'tonalLevel',      unit:'',   fmt:3},
+            {name:'bodyHarmonics',   unit:'',   fmt:3},
+            {name:'fmDepth',         unit:'',   fmt:3},
+            {name:'fmRatio',         unit:'',   fmt:2},
+            {name:'fmDecay',         unit:'s',  fmt:3},
+            {name:'additiveAmt',     unit:'',   fmt:3},
+            {name:'harmonic2',       unit:'',   fmt:3},
+            {name:'harmonic3',       unit:'',   fmt:3},
+            {name:'harmonic4',       unit:'',   fmt:3},
+            {name:'harmonic5',       unit:'',   fmt:3},
+            {name:'inharmonicity',   unit:'',   fmt:4},
+            {name:'unisonVoices',    unit:'',   fmt:0},
+            {name:'unisonDetune',    unit:'ct', fmt:1},
+            {name:'unisonDrift',     unit:'',   fmt:3},
+            {name:'phaseDistort',    unit:'',   fmt:3},
+            {name:'phaseDistDecay',  unit:'s',  fmt:3},
+            {name:'subLevel',        unit:'',   fmt:2},
+            {name:'subDetune',       unit:'Hz', fmt:2}
+        ]},
+        {group:'Layer B \u2014 Noise', params:[
+            {name:'noiseLevel',      unit:'',   fmt:3},
+            {name:'noiseColor',      unit:'',   fmt:2},
+            {name:'noiseFilterFreq', unit:'Hz', fmt:0},
+            {name:'noiseFilterQ',    unit:'',   fmt:2},
+            {name:'noiseDecay',      unit:'s',  fmt:3},
+            {name:'burstCount',      unit:'',   fmt:0},
+            {name:'burstSpacing',    unit:'s',  fmt:4},
+            {name:'noiseAttack',     unit:'s',  fmt:4},
+            {name:'residualAmt',     unit:'',   fmt:3},
+            {name:'residualLevel',   unit:'',   fmt:3},
+            {name:'noiseHP',         unit:'Hz', fmt:0},
+            {name:'noiseStereo',     unit:'',   fmt:3},
+            {name:'noiseEvolution',  unit:'',   fmt:3},
+            {name:'granularDensity', unit:'',   fmt:3}
+        ]},
+        {group:'Layer C \u2014 Modal/KS', params:[
+            {name:'modalLevel',      unit:'',   fmt:3},
+            {name:'modalMode',       unit:'',   fmt:0},
+            {name:'numModes',        unit:'',   fmt:0},
+            {name:'modeDecay',       unit:'s',  fmt:3},
+            {name:'modeSpread',      unit:'',   fmt:3},
+            {name:'modeRatioBase',   unit:'',   fmt:2},
+            {name:'modeDamping',     unit:'',   fmt:3},
+            {name:'ksFeedback',      unit:'',   fmt:3},
+            {name:'ksDamping',       unit:'',   fmt:3},
+            {name:'ksBrightness',    unit:'',   fmt:3},
+            {name:'ksPickPosition',  unit:'',   fmt:3},
+            {name:'ksBodyResonance', unit:'',   fmt:3}
+        ]},
+        {group:'Layer D \u2014 Transient', params:[
+            {name:'transientLevel',  unit:'',   fmt:3},
+            {name:'clickType',       unit:'',   fmt:0},
+            {name:'clickFreq',       unit:'Hz', fmt:0},
+            {name:'clickDecay',      unit:'s',  fmt:4},
+            {name:'clickWidth',      unit:'',   fmt:2},
+            {name:'snapAmount',      unit:'',   fmt:3},
+            {name:'transientSampleAmt',unit:'', fmt:3},
+            {name:'topNoise',        unit:'',   fmt:3}
+        ]},
+        {group:'Envelope', params:[
+            {name:'ampAttack',       unit:'s',  fmt:4},
+            {name:'ampPunchDecay',   unit:'s',  fmt:3},
+            {name:'ampBodyDecay',    unit:'s',  fmt:3},
+            {name:'ampPunchLevel',   unit:'',   fmt:2},
+            {name:'envSustainLevel', unit:'',   fmt:3},
+            {name:'envSustainTime',  unit:'s',  fmt:3},
+            {name:'envRelease',      unit:'s',  fmt:3},
+            {name:'envCurve',        unit:'',   fmt:2}
+        ]},
+        {group:'Filter', params:[
+            {name:'filterCutoff',    unit:'Hz', fmt:0},
+            {name:'filterReso',      unit:'',   fmt:3},
+            {name:'filterSweepAmt',  unit:'',   fmt:3},
+            {name:'filterStart',     unit:'',   fmt:3},
+            {name:'filterEnd',       unit:'',   fmt:3},
+            {name:'formantAmt',      unit:'',   fmt:3},
+            {name:'formantFreq1',    unit:'Hz', fmt:0},
+            {name:'formantFreq2',    unit:'Hz', fmt:0}
+        ]},
+        {group:'Effects', params:[
+            {name:'reverbAmt',       unit:'',   fmt:3},
+            {name:'reverbDecay',     unit:'s',  fmt:3},
+            {name:'chorusAmt',       unit:'',   fmt:3},
+            {name:'satAmount',       unit:'',   fmt:3},
+            {name:'satType',         unit:'',   fmt:0},
+            {name:'compAmount',      unit:'',   fmt:3}
+        ]}
     ];
     var oscNames = ['Sine','Triangle','Saw','Square','Pulse25','Pulse12','HalfRect','AbsSine','Parabolic','Staircase','DblSine','ClipSine'];
 
@@ -591,13 +615,13 @@ static const char* getJS2()
             kmMatchAudio = await ctx.decodeAudioData(ab.slice(0));
         }
 
-        // Score (distance → percentage) — steeper curve for honest perceptual grading
-        // dist < 1.5 = good (>75%), dist 1.5-4 = ok (30-75%), dist > 4 = poor (<30%)
+        // Score: exponential decay — unified formula across display and report
+        // dist < 1.0 = excellent (>70%), dist 1-3 = good (35-70%), dist > 3 = poor (<35%)
         var dist = s.distance;
-        var score = Math.round(Math.max(0, 100 / (1 + dist * 0.8)));
+        var score = Math.round(100 * Math.exp(-dist * 2.0));
         kmScoreValue.textContent = score + '%';
         kmScoreValue.className = 'km-score-value ' +
-            (score >= 75 ? 'good' : score >= 35 ? 'ok' : 'poor');
+            (score >= 70 ? 'good' : score >= 35 ? 'ok' : 'poor');
         // Show buffer diagnostics
         var diag = document.getElementById('kmDiag');
         if (s.bufSamples) {
@@ -608,73 +632,62 @@ static const char* getJS2()
         // Store report for copy
         window._kmLastReport = s;
 
-        kmScoreSub.textContent = 'Distance: ' + dist.toFixed(4) +
-            (s.converged ? ' (converged)' : '') +
-            ' | ' + s.iteration + ' iterations';
+        var subText = 'Distance: ' + dist.toFixed(4);
+        if (s.descDistance !== undefined && s.stftDistance !== undefined)
+            subText += ' (desc=' + Number(s.descDistance).toFixed(2) + ' stft=' + Number(s.stftDistance).toFixed(2) + ')';
+        subText += (s.converged ? ' (converged)' : '') + ' | ' + s.iteration + ' iterations';
+        kmScoreSub.textContent = subText;
 
-        // Extensions display
+        // Spectral match quality display
         if (s.gapAnalysis) {
             var ga = s.gapAnalysis;
-            var extModules = [
-                {key:'needsFM',            label:'FM Synthesis'},
-                {key:'needsResonance',     label:'Resonance'},
-                {key:'needsWobble',        label:'Pitch Wobble'},
-                {key:'needsTransientSnap', label:'Transient Snap'},
-                {key:'needsComb',          label:'Comb Filter'},
-                {key:'needsMultibandSat',  label:'Multiband Sat'},
-                {key:'needsPhaseDistort',  label:'Phase Distort'},
-                {key:'needsAdditive',      label:'Additive Harm'},
-                {key:'needsMultiReson',    label:'Multi Reson'},
-                {key:'needsNoiseShape',    label:'Noise Shape'},
-                {key:'needsEQ',            label:'Param EQ'},
-                {key:'needsEnvComplex',    label:'Env Complex'},
-                {key:'needsStereo',        label:'Stereo'},
-                // v3 extensions
-                {key:'needsUnison',     label:'Unison'},
-                {key:'needsFormant',    label:'Formant'},
-                {key:'needsTransLayer', label:'Trans Layer'},
-                {key:'needsReverb',     label:'Reverb'}
-            ];
-            var chipsHtml = '';
-            for (var e = 0; e < extModules.length; e++) {
-                var active = ga[extModules[e].key];
-                chipsHtml += '<span class="km-ext-chip' + (active ? '' : ' inactive') + '">' +
-                    extModules[e].label + '</span>';
-            }
-            kmExtChips.innerHTML = chipsHtml;
-            if (ga.extensionsActivated > 0) {
-                kmExtPhaseInfo.textContent = 'Phase 1 (core): ' + ga.phase1Iterations + ' iter, dist=' +
-                    ga.phase1Distance.toFixed(3) + ' → Phase 2 (extended): ' +
-                    ga.extensionsActivated + ' modules activated';
+            var info = '';
+            if (ga.melLoss !== undefined) {
+                var envPct = (ga.envCorrelation * 100).toFixed(1);
+                info += '<b>Mel Spectrogram Loss:</b> ' + Number(ga.melLoss).toFixed(3);
+                info += ' &nbsp;|&nbsp; <b>Envelope Corr:</b> ' + envPct + '%';
+                info += ' &nbsp;|&nbsp; <b>Pitch Contour:</b> ' + Number(ga.pitchContourLoss).toFixed(3);
+                info += '<br><b>CMA-ES:</b> ' + ga.cmaGenerations + ' generations';
             } else {
-                kmExtPhaseInfo.textContent = 'Core synth was sufficient — no extensions needed';
+                info = ga.phase1Iterations + ' iterations';
             }
+            kmSpectralInfo.innerHTML = info;
             kmExtSection.style.display = 'block';
         }
 
-        // Parameters with sensitivity bars (skip inactive extensions)
+        // Parameters with sensitivity bars, grouped by layer
         if (s.params) {
             var html = '';
-            for (var i = 0; i < paramInfo.length; i++) {
-                var pi = paramInfo[i];
-                var val = s.params[pi.name];
-                var sens = s.sensitivity ? (s.sensitivity[pi.name] || 0) : 0;
-                // Skip extension params that are inactive (value ≈ 0 and sensitivity ≈ 0)
-                if (pi.ext && Math.abs(val) < 0.001 && sens < 0.01) continue;
-                var display;
-                if (pi.name === 'oscType') {
-                    display = oscNames[Math.round(val)] || val;
-                } else {
-                    display = (typeof val === 'number') ? val.toFixed(pi.fmt) : val;
+            for (var g = 0; g < paramGroups.length; g++) {
+                var grp = paramGroups[g];
+                var groupHtml = '';
+                var hasVisible = false;
+                for (var i = 0; i < grp.params.length; i++) {
+                    var pi = grp.params[i];
+                    var val = s.params[pi.name];
+                    if (val === undefined) continue;
+                    var sens = s.sensitivity ? (s.sensitivity[pi.name] || 0) : 0;
+                    // Skip inactive params (value near 0 and low sensitivity) except Global group
+                    if (g > 0 && Math.abs(val) < 0.001 && sens < 0.01) continue;
+                    hasVisible = true;
+                    var display;
+                    if (pi.name === 'oscType') {
+                        display = oscNames[Math.round(val)] || val;
+                    } else {
+                        display = (typeof val === 'number') ? val.toFixed(pi.fmt) : val;
+                    }
+                    var sensWidth = Math.round(sens * 100);
+                    var sensColor = sens > 0.5 ? 'var(--accent)' : sens > 0.2 ? '#f0c040' : 'var(--text2)';
+                    groupHtml += '<div class="km-param-row"><span class="km-param-name">' + pi.name +
+                        '</span><span class="km-param-val">' + display + (pi.unit ? ' ' + pi.unit : '') +
+                        '<span class="km-param-sens"><span class="km-param-sens-fill" style="width:' +
+                        sensWidth + '%;background:' + sensColor + '"></span></span>' +
+                        '</span></div>';
                 }
-                var sensWidth = Math.round(sens * 100);
-                var sensColor = sens > 0.5 ? 'var(--accent)' : sens > 0.2 ? '#f0c040' : 'var(--text2)';
-                var nameLabel = pi.ext ? '* ' + pi.name : pi.name;
-                html += '<div class="km-param-row"><span class="km-param-name">' + nameLabel +
-                    '</span><span class="km-param-val">' + display + (pi.unit ? ' ' + pi.unit : '') +
-                    '<span class="km-param-sens"><span class="km-param-sens-fill" style="width:' +
-                    sensWidth + '%;background:' + sensColor + '"></span></span>' +
-                    '</span></div>';
+                if (hasVisible) {
+                    html += '<div class="km-desc-group-title" style="grid-column:1/-1">' + grp.group + '</div>';
+                    html += groupHtml;
+                }
             }
             kmParamsGrid.innerHTML = html;
         }
@@ -745,7 +758,10 @@ static const char* getJS2()
         var rd = s.refDescriptors || {};
         var md = s.matchedDescriptors || {};
         var txt = '=== ONE-SHOT MATCH REPORT ===\n';
-        txt += 'Distance: ' + s.distance.toFixed(4) + '\n';
+        txt += 'Distance: ' + s.distance.toFixed(4);
+        if (s.descDistance !== undefined && s.stftDistance !== undefined)
+            txt += ' (desc=' + Number(s.descDistance).toFixed(2) + ' stft=' + Number(s.stftDistance).toFixed(2) + ')';
+        txt += '\n';
         txt += 'Score: ' + Math.round(100 * Math.exp(-s.distance * 0.35)) + '%\n';
         txt += 'Iterations: ' + s.iteration + '/' + s.maxIterations + '\n';
         txt += 'Converged: ' + (s.converged ? 'yes' : 'no') + '\n';
