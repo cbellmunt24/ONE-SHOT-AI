@@ -127,6 +127,23 @@ static const char* getCSS()
 .km-score-value.poor { color: var(--accent); }
 .km-score-sub { font-size: 11px; color: var(--text2); margin-top: 2px; }
 
+.km-blend-section {
+    background: var(--surface); border-radius: var(--radius);
+    border: 1px solid var(--border); padding: 10px 14px; margin-bottom: 12px;
+}
+.km-blend-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.km-blend-label { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; }
+.km-blend-value { font-size: 12px; color: var(--success); font-weight: 600; }
+.km-blend-slider {
+    width: 100%; height: 4px; -webkit-appearance: none; appearance: none;
+    background: var(--surface2); border-radius: 2px; outline: none; cursor: pointer;
+}
+.km-blend-slider::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); cursor: pointer;
+}
+.km-blend-labels { display: flex; justify-content: space-between; font-size: 9px; color: var(--text2); margin-top: 4px; }
+
 .km-desc-compare {
     display: grid; grid-template-columns: auto 1fr 1fr;
     gap: 2px 10px; font-size: 10px; margin-top: 8px;
@@ -211,6 +228,20 @@ static const char* getHTML()
             <div class="km-compare-row">
                 <button id="kmPlayRef">&#9654; Reference</button>
                 <button id="kmPlayMatch">&#9654; Matched</button>
+            </div>
+        </div>
+
+        <!-- Residual Blend Control -->
+        <div class="km-blend-section" id="kmBlendSection">
+            <div class="km-blend-header">
+                <span class="km-blend-label">Synth / Hybrid Blend</span>
+                <span class="km-blend-value" id="kmBlendValue">70%</span>
+            </div>
+            <input type="range" class="km-blend-slider" id="kmBlendSlider"
+                   min="0" max="100" value="70" step="5">
+            <div class="km-blend-labels">
+                <span>Pure Synth</span>
+                <span>Hybrid (Synth + Residual)</span>
             </div>
         </div>
 
@@ -423,6 +454,17 @@ static const char* getJS2()
     var kmPlayMatch = document.getElementById('kmPlayMatch');
     var kmExportAudio = document.getElementById('kmExportAudio');
     var kmExportPreset = document.getElementById('kmExportPreset');
+    var kmBlendSlider = document.getElementById('kmBlendSlider');
+    var kmBlendValue = document.getElementById('kmBlendValue');
+
+    // Blend slider control
+    kmBlendSlider.addEventListener('input', function() {
+        var pct = parseInt(kmBlendSlider.value);
+        kmBlendValue.textContent = pct + '%';
+        fetch('/api/match/blend?value=' + (pct / 100.0).toFixed(2));
+        // Invalidate cached matched audio so next play fetches the new blend
+        kmMatchAudio = null;
+    });
 
     var kmAudioCtx = null, kmCurrentSrc = null, kmPlaying = null;
     var kmRefAudio = window._kmRefAudio || null;
@@ -636,7 +678,16 @@ static const char* getJS2()
         if (s.descDistance !== undefined && s.stftDistance !== undefined)
             subText += ' (desc=' + Number(s.descDistance).toFixed(2) + ' stft=' + Number(s.stftDistance).toFixed(2) + ')';
         subText += (s.converged ? ' (converged)' : '') + ' | ' + s.iteration + ' iterations';
+        if (s.hasCompensation === 'true' || s.hasCompensation === true)
+            subText += ' | Residual: ' + Math.round((s.residualBlend || 0.7) * 100) + '%';
         kmScoreSub.textContent = subText;
+
+        // Sync blend slider with server state
+        if (s.residualBlend !== undefined) {
+            var blendPct = Math.round(s.residualBlend * 100);
+            kmBlendSlider.value = blendPct;
+            kmBlendValue.textContent = blendPct + '%';
+        }
 
         // Spectral match quality display
         if (s.gapAnalysis) {

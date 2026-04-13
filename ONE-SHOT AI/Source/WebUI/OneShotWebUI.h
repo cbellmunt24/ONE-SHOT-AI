@@ -2,6 +2,7 @@
 
 #include <string>
 #include "OneShotMatchWebUI.h"
+#include "OneShotSynthWebUI.h"
 
 // HTML/CSS/JS completo para la WebUI del ONE-SHOT AI.
 // Servido inline desde getResource() — no requiere archivos externos ni binary resources.
@@ -224,6 +225,7 @@ static const char* htmlBody()
 <div class="tab-bar">
     <button class="tab-btn active" data-tab="generator" id="tabGenerator">Generator</button>
     <button class="tab-btn" data-tab="oneshotmatch" id="tabOneShotMatch">One-Shot Match</button>
+    <button class="tab-btn" data-tab="syntheditor" id="tabSynthEditor">Synth</button>
 </div>
 
 <!-- Generator container (existing UI) -->
@@ -343,22 +345,26 @@ static const char* jsCode()
 {
     return R"js1(
 <script>
-// === Tab switching ===
+// === Tab switching (3 tabs) ===
 (function() {
     var tabs = document.querySelectorAll('.tab-btn');
     var genC = document.getElementById('genContainer');
     var kmC = document.getElementById('kmContainer');
+    var seC = document.getElementById('synthContainer');
     tabs.forEach(function(tab) {
         tab.addEventListener('click', function() {
             tabs.forEach(function(t){ t.classList.remove('active'); });
             tab.classList.add('active');
             var which = tab.getAttribute('data-tab');
+            genC.classList.add('hidden');
+            kmC.classList.remove('active');
+            if (seC) seC.classList.remove('active');
             if (which === 'generator') {
                 genC.classList.remove('hidden');
-                kmC.classList.remove('active');
-            } else {
-                genC.classList.add('hidden');
+            } else if (which === 'oneshotmatch') {
                 kmC.classList.add('active');
+            } else if (which === 'syntheditor') {
+                if (seC) seC.classList.add('active');
             }
         });
     });
@@ -511,11 +517,16 @@ static const char* getHTML()
 {
     static std::string html = std::string (cssPart1()) + cssPart2()
                             + OneShotMatchWebUI::getCSS()
+                            + OneShotSynthWebUI::getCSS()
                             + htmlBody()
                             + OneShotMatchWebUI::getHTML()
+                            + OneShotSynthWebUI::getHTML()
                             + jsCode()
                             + OneShotMatchWebUI::getJS()
                             + OneShotMatchWebUI::getJS2()
+                            + OneShotSynthWebUI::getJS()
+                            + OneShotSynthWebUI::getJS2()
+                            + OneShotSynthWebUI::getJS3()
                             + htmlClosing();
     return html.c_str();
 }

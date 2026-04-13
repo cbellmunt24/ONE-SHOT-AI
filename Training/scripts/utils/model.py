@@ -16,11 +16,11 @@ N_INSTRUMENTS = len(INSTRUMENTS)
 N_GENRES = len(GENRES)
 N_SLIDERS = 5  # brillo, cuerpo, textura, movimiento, impacto
 INPUT_DIM = N_INSTRUMENTS + N_GENRES + N_SLIDERS  # 24
-MAX_OUTPUT_PARAMS = 35
+MAX_OUTPUT_PARAMS = 88  # UniversalSynth: 88 universal params
 
 
 class OneShotParamPredictor(nn.Module):
-    def __init__(self, input_dim=INPUT_DIM, hidden1=128, hidden2=64,
+    def __init__(self, input_dim=INPUT_DIM, hidden1=256, hidden2=128,
                  output_dim=MAX_OUTPUT_PARAMS):
         super().__init__()
         self.net = nn.Sequential(

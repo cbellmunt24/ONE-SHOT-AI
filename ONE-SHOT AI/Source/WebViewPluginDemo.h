@@ -252,6 +252,10 @@ public:
     juce::AudioBuffer<float> lastGeneratedBuffer;
     juce::String lastFileName;
 
+    // Last generated universal synth params (for Synth Editor tab)
+    universalsynth::UniversalSynthParams lastSynthParams;
+    bool hasSynthParams = false;
+
     // One-Shot Match system (independent from generator)
     oneshotmatch::OneShotMatchEngine matchEngine;
 
@@ -416,7 +420,7 @@ WebViewPluginAudioProcessorEditor::WebViewPluginAudioProcessorEditor (WebViewPlu
     addAndMakeVisible (dragComponent);
     addAndMakeVisible (webComponent);
     webComponent.goToURL (juce::WebBrowserComponent::getResourceProviderRoot());
-    setSize (480, 720);
+    setSize (480, 780);
 }
 
 //==============================================================================
@@ -461,6 +465,8 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
                                                           req.seed);
 
         processorRef.lastGeneratedBuffer = buffer;
+        processorRef.lastSynthParams = result.universalParams;
+        processorRef.hasSynthParams = true;
 
         // Build filename for drag-to-DAW strip
         {
@@ -649,6 +655,8 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
                 json += ",\"bufSamples\":" + juce::String (mbuf.getNumSamples());
                 json += ",\"bufSR\":" + juce::String (engine.getSampleRate(), 0);
                 json += ",\"bufDurationMs\":" + juce::String (1000.0 * mbuf.getNumSamples() / engine.getSampleRate(), 1);
+                json += ",\"residualBlend\":" + juce::String (engine.getResidualBlend(), 2);
+                json += ",\"hasCompensation\":" + juce::String (engine.getCompensatedBuffer().getNumSamples() > 0 ? "true" : "false");
             }
         }
 
@@ -672,10 +680,24 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
                                                       juce::String { "application/json" } };
     }
 
-    // ── API: One-Shot Match — Get matched audio as WAV ──
+    // ── API: One-Shot Match — Set/Get residual blend ──
+    if (urlToRetrieve.startsWith ("api/match/blend"))
+    {
+        auto blendUrl = juce::URL (urlToRetrieve);
+        auto blendStr = blendUrl.getParameterValues() [blendUrl.getParameterNames().indexOf ("value")];
+        if (blendStr.isNotEmpty())
+            processorRef.matchEngine.setResidualBlend (blendStr.getFloatValue());
+
+        juce::String json = "{\"blend\":" + juce::String (processorRef.matchEngine.getResidualBlend(), 2) + "}";
+        juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
+    // ── API: One-Shot Match — Get matched audio as WAV (uses compensated if blend > 0) ──
     if (urlToRetrieve.startsWith ("api/match/audio"))
     {
-        auto& buf = processorRef.matchEngine.getMatchedBuffer();
+        auto& buf = processorRef.matchEngine.getOutputBuffer();
         if (buf.getNumSamples() > 0)
         {
             auto wavData = encodeWav (buf, processorRef.matchEngine.getSampleRate());
@@ -793,6 +815,93 @@ WebViewPluginAudioProcessorEditor::getResource (const juce::String& url)
         file.replaceWithText (txt);
 
         juce::String json = "{\"ok\":true,\"path\":\"" + file.getFullPathName().replace ("\\", "\\\\") + "\"}";
+        juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
+        return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                      juce::String { "application/json" } };
+    }
+
+    // ── API: Synth Editor — Render with explicit 88 params ──
+    if (urlToRetrieve.startsWith ("api/synth/render"))
+    {
+        auto params = parseQueryParams (urlToRetrieve);
+
+        universalsynth::UniversalSynthParams synthParams;
+        float arr[universalsynth::UniversalSynthParams::NUM_PARAMS];
+        synthParams.toArray (arr);
+
+        for (int i = 0; i < universalsynth::UniversalSynthParams::NUM_PARAMS; ++i)
+        {
+            auto key = "p" + juce::String (i);
+            if (params.containsKey (key))
+                arr[i] = params.getValue (key, "0").getFloatValue();
+        }
+        synthParams.fromArray (arr);
+
+        unsigned int seed = (unsigned int) params.getValue ("seed", "0").getIntValue();
+
+        GenerationResult result;
+        result.universalParams = synthParams;
+        auto buffer = processorRef.synthEngine.generate (result,
+                                                          processorRef.generationSampleRate,
+                                                          seed);
+
+        processorRef.lastGeneratedBuffer = buffer;
+        processorRef.lastSynthParams = synthParams;
+        processorRef.hasSynthParams = true;
+        processorRef.lastFileName = "SynthEditor_" + juce::String ((int) seed) + ".wav";
+        dragComponent.repaint();
+
+        auto wavData = encodeWav (buffer, processorRef.generationSampleRate);
+
+        if (wavData.empty())
+            return std::nullopt;
+
+        return juce::WebBrowserComponent::Resource { std::move (wavData),
+                                                      juce::String { "audio/wav" } };
+    }
+
+    // ── API: Synth Editor — Get last params as JSON array ──
+    if (urlToRetrieve.startsWith ("api/synth/last-params"))
+    {
+        auto params = parseQueryParams (urlToRetrieve);
+        auto source = params.getValue ("source", "generate");
+
+        float arr[universalsynth::UniversalSynthParams::NUM_PARAMS] = {};
+        bool valid = false;
+
+        if (source == "match")
+        {
+            if (processorRef.matchEngine.getState() == oneshotmatch::MatchState::Done)
+            {
+                processorRef.matchEngine.getBestParams().toArray (arr);
+                valid = true;
+            }
+        }
+        else
+        {
+            if (processorRef.hasSynthParams)
+            {
+                processorRef.lastSynthParams.toArray (arr);
+                valid = true;
+            }
+        }
+
+        if (! valid)
+        {
+            juce::String json = "{\"error\":\"No params available\"}";
+            juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
+            return juce::WebBrowserComponent::Resource { streamToVector (stream),
+                                                          juce::String { "application/json" } };
+        }
+
+        juce::String json = "[";
+        for (int i = 0; i < universalsynth::UniversalSynthParams::NUM_PARAMS; ++i)
+        {
+            if (i > 0) json += ",";
+            json += juce::String (arr[i], 6);
+        }
+        json += "]";
+
         juce::MemoryInputStream stream (json.getCharPointer(), json.getNumBytesAsUTF8(), false);
         return juce::WebBrowserComponent::Resource { streamToVector (stream),
                                                       juce::String { "application/json" } };

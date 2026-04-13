@@ -214,36 +214,17 @@ public:
         int pitchBodyEnd   = std::min (peakIdx + (int)(0.100f * sr), numSamples - 1);
         d.fundamentalFreq = estimateF0Autocorrelation (mono, pitchBodyStart, pitchBodyEnd, sr);
 
-        // === F0 sanity check: validate against spectral centroid ===
-        // If f0 is much higher than spectralCentroid, autocorrelation likely locked onto a harmonic.
-        // Also try a wider window for very low-frequency sounds.
+        // === F0 sanity check: wider window for very low-frequency sounds ===
+        // YIN is robust against octave errors, but a wider window helps for sub-bass
         {
-            // Quick spectral centroid from full signal for validation
-            int quickFFTOrder = 11;
-            int quickFFTSize = 1 << quickFFTOrder;
-            float quickCentroid = 0.0f;
-            if (numSamples >= quickFFTSize)
-            {
-                auto qSpec = computeSpectrum (mono, 0, quickFFTSize, sr, quickFFTOrder);
-                quickCentroid = qSpec.spectralCentroid;
-            }
-
-            // Try wider window (0 to end) for more reliable low-freq detection
             float f0Wide = estimateF0Autocorrelation (mono, 0, std::min (numSamples, (int)(sr * 0.15f)), sr);
 
-            // If quick centroid is available and f0 seems wrong
-            if (quickCentroid > 10.0f && d.fundamentalFreq > quickCentroid * 3.0f)
-            {
-                // f0 is way higher than centroid — probably wrong
-                if (f0Wide > 10.0f && f0Wide < quickCentroid * 2.5f)
-                    d.fundamentalFreq = f0Wide;  // wider window gave better result
-                else
-                    d.fundamentalFreq = quickCentroid;  // use centroid as best guess
-            }
+            // If body window gave no result but wider window did, use wider
+            if (d.fundamentalFreq < 15.0f && f0Wide > 15.0f)
+                d.fundamentalFreq = f0Wide;
 
-            // If both windows disagree significantly, prefer the lower one
-            // (autocorrelation tends to find harmonics, not subharmonics)
-            if (f0Wide > 10.0f && d.fundamentalFreq > f0Wide * 1.8f)
+            // If both disagree significantly, prefer the lower (likely fundamental)
+            if (f0Wide > 15.0f && d.fundamentalFreq > f0Wide * 1.8f)
                 d.fundamentalFreq = f0Wide;
         }
 
@@ -770,70 +751,92 @@ private:
         return (mean > 1e-10f) ? (maxVal / mean) : 1.0f;
     }
 
-    // ========== Pitch estimation (autocorrelation) ==========
+    // ========== Pitch estimation: YIN algorithm (Cheveigné & Kawahara 2002) ==========
+    // Key advantage over autocorrelation: cumulative mean normalized difference
+    // finds the FIRST dip below threshold (fundamental), not the global maximum
+    // (which may be a harmonic). This eliminates octave-locking errors.
 
     float estimateF0Autocorrelation (const std::vector<float>& mono, int start, int end, float sr)
     {
         int len = end - start;
         if (len < 32) return 0.0f;
 
-        int minLag = (int)(sr / 500.0f);
-        int maxLag = std::min (len / 2, (int)(sr / 20.0f));
+        int minLag = std::max (2, (int)(sr / 500.0f));  // up to 500 Hz
+        int maxLag = std::min (len / 2, (int)(sr / 20.0f)); // down to 20 Hz
         if (maxLag <= minLag) return 0.0f;
 
-        float bestCorr = -1.0f;
-        int bestLag = minLag;
-
-        for (int lag = minLag; lag <= maxLag; ++lag)
+        // Step 1: Difference function d(tau) = sum((x[i] - x[i+tau])^2)
+        std::vector<float> diff (maxLag + 1, 0.0f);
+        for (int tau = 1; tau <= maxLag; ++tau)
         {
-            float corr = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
-            int corrLen = len - lag;
+            float sum = 0.0f;
+            int corrLen = len - tau;
             for (int i = 0; i < corrLen; ++i)
             {
-                float a = mono[start + i];
-                float b = mono[start + i + lag];
-                corr += a * b;
-                norm1 += a * a;
-                norm2 += b * b;
+                float d = mono[start + i] - mono[start + i + tau];
+                sum += d * d;
             }
+            diff[tau] = sum;
+        }
 
-            float denom = std::sqrt (norm1 * norm2);
-            if (denom > 0.0f)
+        // Step 2: Cumulative Mean Normalized Difference (CMND)
+        // d'(tau) = d(tau) / ((1/tau) * sum(d(j), j=1..tau))
+        // d'(1) = 1 by definition
+        std::vector<float> cmnd (maxLag + 1, 0.0f);
+        cmnd[0] = 1.0f;
+        float runningSum = 0.0f;
+        for (int tau = 1; tau <= maxLag; ++tau)
+        {
+            runningSum += diff[tau];
+            cmnd[tau] = (runningSum > 1e-10f) ? diff[tau] * (float) tau / runningSum : 1.0f;
+        }
+
+        // Step 3: Absolute threshold — find FIRST tau where cmnd < threshold
+        // YIN's key insight: prefer fundamental over harmonics
+        const float threshold = 0.15f;
+        int bestLag = -1;
+
+        for (int tau = minLag; tau <= maxLag; ++tau)
+        {
+            if (cmnd[tau] < threshold)
             {
-                float normalized = corr / denom;
-                if (normalized > bestCorr)
-                {
-                    bestCorr = normalized;
-                    bestLag = lag;
-                }
+                // Find the local minimum in this dip
+                while (tau + 1 <= maxLag && cmnd[tau + 1] < cmnd[tau])
+                    ++tau;
+                bestLag = tau;
+                break;
             }
         }
 
-        if (bestCorr < 0.3f) return 0.0f;
+        // Fallback: if no dip below threshold, find global minimum
+        if (bestLag < 0)
+        {
+            float bestVal = 1e6f;
+            for (int tau = minLag; tau <= maxLag; ++tau)
+            {
+                if (cmnd[tau] < bestVal)
+                {
+                    bestVal = cmnd[tau];
+                    bestLag = tau;
+                }
+            }
+            // If global min is still too high, no pitch detected
+            if (bestVal > 0.5f) return 0.0f;
+        }
 
-        // Parabolic interpolation for sub-sample accuracy
+        // Step 4: Parabolic interpolation for sub-sample accuracy
         if (bestLag > minLag && bestLag < maxLag)
         {
-            auto corrAt = [&](int lag) -> float
+            float y0 = cmnd[bestLag - 1];
+            float y1 = cmnd[bestLag];
+            float y2 = cmnd[bestLag + 1];
+            float denom = 2.0f * (2.0f * y1 - y0 - y2);
+            if (std::abs (denom) > 1e-10f)
             {
-                float c = 0.0f, n1 = 0.0f, n2 = 0.0f;
-                int cLen = len - lag;
-                for (int i = 0; i < cLen; ++i)
-                {
-                    float a = mono[start + i];
-                    float b = mono[start + i + lag];
-                    c += a * b; n1 += a * a; n2 += b * b;
-                }
-                float d = std::sqrt (n1 * n2);
-                return (d > 0.0f) ? c / d : 0.0f;
-            };
-
-            float y0 = corrAt (bestLag - 1);
-            float y1 = bestCorr;
-            float y2 = corrAt (bestLag + 1);
-            float shift = 0.5f * (y0 - y2) / (y0 - 2.0f * y1 + y2 + 1e-10f);
-            float refinedLag = (float) bestLag + std::max (-0.5f, std::min (0.5f, shift));
-            return sr / refinedLag;
+                float shift = (y0 - y2) / denom;
+                float refinedLag = (float) bestLag + std::max (-0.5f, std::min (0.5f, shift));
+                return sr / refinedLag;
+            }
         }
 
         return sr / (float) bestLag;
@@ -1148,6 +1151,17 @@ inline std::vector<std::vector<float>> computeMelSpectrogram (
     return result;
 }
 
+// A-weighting from frequency in Hz — used for per-bin spectral weighting
+inline float aWeightForFreq (float fc)
+{
+    if (fc < 10.0f) return 0.0f;
+    float f2 = fc * fc;
+    float num = 12194.0f * 12194.0f * f2 * f2;
+    float den = (f2 + 20.6f * 20.6f) * std::sqrt ((f2 + 107.7f * 107.7f) * (f2 + 737.9f * 737.9f)) * (f2 + 12194.0f * 12194.0f);
+    float aW = (den > 0.0f) ? num / den : 0.0f;
+    return std::min (1.0f, aW * 1.25f); // normalize so max ~= 1.0 at ~2.5 kHz
+}
+
 // Multi-resolution mel spectrogram loss
 // Compares ref and gen audio using Spectral Convergence + Log Magnitude distance
 // CRITICAL: Pads shorter signal with zeros so duration mismatch is penalized
@@ -1164,8 +1178,23 @@ inline float computeMelSpectrogramLoss (const std::vector<float>& refMono,
     refPad.resize (maxLen, 0.0f);
     genPad.resize (maxLen, 0.0f);
 
-    // NO loudness normalization here — RMS loss handles volume separately
-    // Normalization was masking spectral shape differences
+    // Loudness normalize both signals so spectral SHAPE is compared, not volume
+    // RMS loss handles absolute loudness separately
+    {
+        float refRMS = 0.0f, genRMS = 0.0f;
+        for (int i = 0; i < maxLen; ++i)
+        {
+            refRMS += refPad[i] * refPad[i];
+            genRMS += genPad[i] * genPad[i];
+        }
+        refRMS = std::sqrt (refRMS / (float) maxLen);
+        genRMS = std::sqrt (genRMS / (float) maxLen);
+        if (refRMS > 1e-8f && genRMS > 1e-8f)
+        {
+            float gain = refRMS / genRMS;
+            for (auto& s : genPad) s *= gain;
+        }
+    }
 
     static constexpr int NUM_RES = 3;
     static constexpr int fftSizes[NUM_RES] = { 512, 1024, 2048 };
@@ -1290,37 +1319,48 @@ inline float computePitchContourLoss (const std::vector<float>& refMono,
     numFrames = std::min (numFrames, 20); // cap at 200ms
     if (numFrames < 2) return 0.0f;
 
-    // Simple autocorrelation f0 per frame
+    // YIN-based f0 per frame (same algorithm as DescriptorExtractor::estimateF0Autocorrelation)
     auto estimateFrameF0 = [&](const std::vector<float>& mono, int frameStart, int frameLen, float sr) -> float
     {
-        int minLag = (int)(sr / 500.0f);  // up to 500 Hz
-        int maxLag = std::min (frameLen / 2, (int)(sr / 20.0f)); // down to 20 Hz
+        int minLag = std::max (2, (int)(sr / 500.0f));
+        int maxLag = std::min (frameLen / 2, (int)(sr / 20.0f));
         if (maxLag <= minLag) return 0.0f;
 
-        float bestCorr = -1.0f;
-        int bestLag = minLag;
-
-        for (int lag = minLag; lag <= maxLag; ++lag)
+        // YIN difference function + CMND
+        std::vector<float> diff (maxLag + 1, 0.0f);
+        for (int tau = 1; tau <= maxLag; ++tau)
         {
-            float corr = 0.0f, n1 = 0.0f, n2 = 0.0f;
-            int corrLen = frameLen - lag;
-            for (int i = 0; i < corrLen; ++i)
+            float sum = 0.0f;
+            for (int i = 0; i < frameLen - tau; ++i)
             {
-                float a = mono[frameStart + i];
-                float b = mono[frameStart + i + lag];
-                corr += a * b;
-                n1 += a * a;
-                n2 += b * b;
+                float d = mono[frameStart + i] - mono[frameStart + i + tau];
+                sum += d * d;
             }
-            float d = std::sqrt (n1 * n2);
-            if (d > 0.0f)
-            {
-                float norm = corr / d;
-                if (norm > bestCorr) { bestCorr = norm; bestLag = lag; }
-            }
+            diff[tau] = sum;
         }
 
-        return (bestCorr > 0.3f) ? sr / (float) bestLag : 0.0f;
+        std::vector<float> cmnd (maxLag + 1, 1.0f);
+        float runSum = 0.0f;
+        for (int tau = 1; tau <= maxLag; ++tau)
+        {
+            runSum += diff[tau];
+            cmnd[tau] = (runSum > 1e-10f) ? diff[tau] * (float) tau / runSum : 1.0f;
+        }
+
+        // Find first dip below threshold
+        int bestLag = -1;
+        for (int tau = minLag; tau <= maxLag; ++tau)
+        {
+            if (cmnd[tau] < 0.2f)
+            {
+                while (tau + 1 <= maxLag && cmnd[tau + 1] < cmnd[tau]) ++tau;
+                bestLag = tau;
+                break;
+            }
+        }
+        if (bestLag < 0) return 0.0f;
+
+        return sr / (float) bestLag;
     };
 
     float totalError = 0.0f;
@@ -1380,9 +1420,10 @@ inline float computeRMSLoss (const std::vector<float>& refMono,
     return std::min (5.0f, std::abs (std::log (std::max (0.01f, ratio))));
 }
 
-// Multi-resolution LINEAR STFT loss — raw frequency bins, critical for bass/kick accuracy
-// At 2048 FFT each bin = 21.5 Hz — can distinguish 60 Hz from 80 Hz kicks
-// Pads shorter signal with zeros (same as mel loss)
+// 7-resolution LINEAR STFT loss — from transient detail (64) to bass precision (4096)
+// Small FFT (64-256): captures transient/attack detail (critical for drums)
+// Medium FFT (512-1024): captures pitch and formants
+// Large FFT (2048-4096): captures fine spectral detail and bass harmonics
 inline float computeLinearSTFTLoss (const std::vector<float>& refMono,
                                      const std::vector<float>& genMono,
                                      float sampleRate)
@@ -1395,19 +1436,35 @@ inline float computeLinearSTFTLoss (const std::vector<float>& refMono,
     refPad.resize (maxLen, 0.0f);
     genPad.resize (maxLen, 0.0f);
 
-    // NO loudness normalization — RMS loss handles that separately
-    // This way spectral SHAPE differences are preserved
+    // Loudness normalize so we compare spectral SHAPE, not volume
+    {
+        float refRMS = 0.0f, genRMS = 0.0f;
+        for (int i = 0; i < maxLen; ++i)
+        {
+            refRMS += refPad[i] * refPad[i];
+            genRMS += genPad[i] * genPad[i];
+        }
+        refRMS = std::sqrt (refRMS / (float) maxLen);
+        genRMS = std::sqrt (genRMS / (float) maxLen);
+        if (refRMS > 1e-8f && genRMS > 1e-8f)
+        {
+            float gain = refRMS / genRMS;
+            for (auto& s : genPad) s *= gain;
+        }
+    }
 
-    static constexpr int NUM_RES = 3;
-    static constexpr int fftOrders[NUM_RES] = { 9, 10, 11 }; // 512, 1024, 2048
-    static constexpr float resWeights[NUM_RES] = { 0.2f, 0.4f, 0.4f }; // emphasize 1024+2048 for bass
+    // 7 resolutions: transient → bass
+    static constexpr int NUM_RES = 7;
+    static constexpr int fftOrders[NUM_RES] = { 6, 7, 8, 9, 10, 11, 12 }; // 64,128,256,512,1024,2048,4096
+    static constexpr float resWeights[NUM_RES] = { 0.08f, 0.10f, 0.12f, 0.15f, 0.20f, 0.20f, 0.15f };
 
     float totalLoss = 0.0f;
+    float totalWeight = 0.0f;
 
     for (int r = 0; r < NUM_RES; ++r)
     {
         int fftSize = 1 << fftOrders[r];
-        int hopSize = fftSize / 4;
+        int hopSize = std::max (1, fftSize / 4);
         int numBins = fftSize / 2;
 
         if (maxLen < fftSize) continue;
@@ -1415,11 +1472,11 @@ inline float computeLinearSTFTLoss (const std::vector<float>& refMono,
         juce::dsp::FFT fft (fftOrders[r]);
 
         int numFrames = std::max (1, (maxLen - fftSize) / hopSize + 1);
-        numFrames = std::min (numFrames, 32); // more frames than before for better coverage
+        numFrames = std::min (numFrames, 48);
 
         float scDiffSq = 0.0f, scRefSq = 0.0f;
         float logMagSum = 0.0f;
-        int totalBins = 0;
+        int totalBinCount = 0;
 
         std::vector<float> refFFT (fftSize * 2, 0.0f);
         std::vector<float> genFFT (fftSize * 2, 0.0f);
@@ -1449,48 +1506,145 @@ inline float computeLinearSTFTLoss (const std::vector<float>& refMono,
                 float refLog = std::log (std::max (1e-7f, refMag));
                 float genLog = std::log (std::max (1e-7f, genMag));
 
+                // Mild perceptual weighting: sqrt(A-weight) with high floor
+                // Avoids killing sub-bass (critical for kicks/bass) while still
+                // boosting perceptually important mid-range (1-5kHz)
+                float binFreq = (float) b * sampleRate / (float) fftSize;
+                float aW = std::max (0.4f, std::sqrt (aWeightForFreq (binFreq))); // sqrt + floor=0.4
+
                 float diff = refLog - genLog;
-                scDiffSq += diff * diff;
-                scRefSq += refLog * refLog;
-                logMagSum += std::abs (diff);
-                ++totalBins;
+                scDiffSq += aW * diff * diff;
+                scRefSq += aW * refLog * refLog;
+                logMagSum += aW * std::abs (diff);
+                ++totalBinCount;
             }
         }
 
         float sc = (scRefSq > 1e-10f) ? std::sqrt (scDiffSq / scRefSq) : std::sqrt (scDiffSq);
-        float lm = (totalBins > 0) ? logMagSum / (float) totalBins : 0.0f;
+        float lm = (totalBinCount > 0) ? logMagSum / (float) totalBinCount : 0.0f;
 
         totalLoss += resWeights[r] * (sc + lm);
+        totalWeight += resWeights[r];
     }
 
-    return totalLoss;
+    return (totalWeight > 0.01f) ? totalLoss / totalWeight : totalLoss;
 }
 
-// Composite spectral match loss — combines linear STFT + mel + envelope + pitch + RMS
+// Time-domain attack waveform loss: L1 shape + energy matching on first 10ms
+// Critical for drums — the transient shape AND energy define the "hit" character
+inline float computeAttackWaveformLoss (const std::vector<float>& refMono,
+                                         const std::vector<float>& genMono,
+                                         float sampleRate)
+{
+    int attackSamples = std::min ((int)(sampleRate * 0.010f), (int) refMono.size()); // 10ms
+    if (attackSamples < 8) return 0.0f;
+
+    // Compute RMS of attack regions (unnormalized energy)
+    float refSq = 0.0f, genSq = 0.0f;
+    float refPeak = 0.0f, genPeak = 0.0f;
+    for (int i = 0; i < attackSamples; ++i)
+    {
+        float rv = std::abs (refMono[i]);
+        float gv = (i < (int) genMono.size()) ? std::abs (genMono[i]) : 0.0f;
+        refSq += rv * rv;
+        genSq += gv * gv;
+        refPeak = std::max (refPeak, rv);
+        genPeak = std::max (genPeak, gv);
+    }
+    if (refPeak < 1e-8f) return 0.0f;
+
+    float refRMS = std::sqrt (refSq / (float) attackSamples);
+    float genRMS = std::sqrt (genSq / (float) attackSamples);
+
+    // Shape loss: L1 on peak-normalized waveform
+    float refScale = 1.0f / refPeak;
+    float genScale = (genPeak > 1e-8f) ? 1.0f / genPeak : 1.0f;
+
+    float l1Sum = 0.0f;
+    for (int i = 0; i < attackSamples; ++i)
+    {
+        float rv = refMono[i] * refScale;
+        float gv = (i < (int) genMono.size()) ? genMono[i] * genScale : 0.0f;
+        l1Sum += std::abs (rv - gv);
+    }
+    float shapeLoss = l1Sum / (float) attackSamples;
+
+    // Energy loss: relative RMS difference (captures transient energy, not just shape)
+    float energyLoss = (refRMS > 1e-8f) ? std::abs (refRMS - genRMS) / refRMS : 0.0f;
+
+    return 0.7f * shapeLoss + 0.3f * std::min (2.0f, energyLoss);
+}
+
+// Point-by-point RMS envelope distance (2ms frames) + derivative matching
+// Measures actual amplitude values AND slopes for transient fidelity
+inline float computeEnvelopeDistance (const std::vector<float>& refMono,
+                                      const std::vector<float>& genMono,
+                                      float sampleRate)
+{
+    int hopSamples = std::max (1, (int)(sampleRate * 0.002f)); // 2ms
+    int refLen = (int) refMono.size();
+    int numFrames = refLen / hopSamples;
+    if (numFrames < 2) return 1.0f;
+
+    std::vector<float> refEnv (numFrames), genEnv (numFrames);
+
+    for (int f = 0; f < numFrames; ++f)
+    {
+        int start = f * hopSamples;
+        float refSq = 0.0f, genSq = 0.0f;
+        for (int i = 0; i < hopSamples && (start + i) < refLen; ++i)
+        {
+            float rv = refMono[start + i];
+            float gv = (start + i < (int) genMono.size()) ? genMono[start + i] : 0.0f;
+            refSq += rv * rv;
+            genSq += gv * gv;
+        }
+        refEnv[f] = std::sqrt (refSq);
+        genEnv[f] = std::sqrt (genSq);
+    }
+
+    // Value loss: L1 on RMS per frame
+    float totalDiff = 0.0f, totalRef = 0.0f;
+    for (int f = 0; f < numFrames; ++f)
+    {
+        totalDiff += std::abs (refEnv[f] - genEnv[f]);
+        totalRef += refEnv[f];
+    }
+    float valueLoss = (totalRef > 1e-6f) ? totalDiff / totalRef : totalDiff;
+
+    // Derivative loss: L1 on slope (rewards matching attack/decay shape)
+    float derivDiff = 0.0f, derivRef = 0.0f;
+    for (int f = 1; f < numFrames; ++f)
+    {
+        float dRef = refEnv[f] - refEnv[f - 1];
+        float dGen = genEnv[f] - genEnv[f - 1];
+        derivDiff += std::abs (dRef - dGen);
+        derivRef += std::abs (dRef);
+    }
+    float derivLoss = (derivRef > 1e-6f) ? derivDiff / derivRef : derivDiff;
+
+    return 0.65f * valueLoss + 0.35f * derivLoss;
+}
+
+// Composite spectral match loss v6
+// 7-resolution STFT + mel + envelope distance + attack waveform + pitch + RMS
 inline float computeSpectralMatchLoss (const std::vector<float>& refMono,
                                         const std::vector<float>& genMono,
                                         float sampleRate, float hnr)
 {
-    // Linear STFT: critical for bass/kick — high frequency resolution at low freqs
     float stftLoss = computeLinearSTFTLoss (refMono, genMono, sampleRate);
-
-    // Mel spectrogram: good for mid/high frequency timbre
     float melLoss = computeMelSpectrogramLoss (refMono, genMono, sampleRate);
-
-    // Envelope: time-domain amplitude shape matching
-    float envCorr = computeEnvelopeCorrelation (refMono, genMono, sampleRate);
-
-    // Pitch contour: fundamental frequency tracking
+    float envDist = computeEnvelopeDistance (refMono, genMono, sampleRate);
+    float attackLoss = computeAttackWaveformLoss (refMono, genMono, sampleRate);
     float pitchLoss = computePitchContourLoss (refMono, genMono, sampleRate, hnr);
-
-    // RMS: overall loudness match
     float rmsLoss = computeRMSLoss (refMono, genMono);
 
-    return 0.35f * stftLoss          // linear STFT — bass/kick accuracy
-         + 0.20f * melLoss           // mel spectrogram — mid/high timbre
-         + 0.20f * (1.0f - envCorr)  // envelope shape
-         + 0.10f * pitchLoss         // pitch accuracy
-         + 0.15f * rmsLoss;          // loudness
+    return 0.30f * stftLoss          // 7-res linear STFT with A-weighting — full spectral
+         + 0.25f * melLoss           // mel spectrogram — perceptual timbre
+         + 0.20f * envDist           // envelope distance + derivative matching
+         + 0.10f * attackLoss        // transient shape + energy
+         + 0.05f * pitchLoss         // pitch accuracy (also captured by STFT)
+         + 0.10f * rmsLoss;          // loudness (also captured by envelope)
 }
 
 // ========== Distance computation ==========

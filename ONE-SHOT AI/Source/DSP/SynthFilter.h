@@ -28,6 +28,11 @@ public:
 
     float process (float x)
     {
+        // NaN safety: reset state if corrupted
+        if (std::isnan (ic1eq) || std::isinf (ic1eq)) ic1eq = 0.0f;
+        if (std::isnan (ic2eq) || std::isinf (ic2eq)) ic2eq = 0.0f;
+        if (std::isnan (x) || std::isinf (x)) x = 0.0f;
+
         float v3 = x - ic2eq;
         float v1 = a1 * ic1eq + a2 * v3;
         float v2 = ic2eq + a2 * v1 + a3 * v3;

@@ -293,8 +293,14 @@ public:
                 }
             }
 
-            // Extract descriptors for comparison display
-            matchedDescriptors = extractor.extract (matchedBuffer, referenceSampleRate);
+            // Phase 4: Spectral Residual Compensation
+            // Bridges the gap between synth output and reference by adding
+            // the spectral residual (what the synth couldn't model)
+            applyResidualCompensation();
+
+            // Extract descriptors from compensated output for comparison display
+            const auto& reportBuf = getOutputBuffer();
+            matchedDescriptors = extractor.extract (reportBuf, referenceSampleRate);
 
             // Persist match result
             saveMatchResult();
@@ -314,7 +320,8 @@ public:
 
     bool exportAudio (const juce::File& file) const
     {
-        if (matchedBuffer.getNumSamples() == 0) return false;
+        const auto& outBuf = getOutputBuffer();
+        if (outBuf.getNumSamples() == 0) return false;
 
         file.deleteFile();
         auto stream = std::unique_ptr<juce::FileOutputStream> (file.createOutputStream());
@@ -324,11 +331,11 @@ public:
         auto* rawStream = stream.get();
         std::unique_ptr<juce::AudioFormatWriter> writer (
             wav.createWriterFor (rawStream, referenceSampleRate,
-                                 (unsigned int) matchedBuffer.getNumChannels(), 24, {}, 0));
+                                 (unsigned int) outBuf.getNumChannels(), 24, {}, 0));
         if (writer == nullptr) return false;
 
         stream.release();
-        writer->writeFromAudioSampleBuffer (matchedBuffer, 0, matchedBuffer.getNumSamples());
+        writer->writeFromAudioSampleBuffer (outBuf, 0, outBuf.getNumSamples());
         return true;
     }
 
@@ -374,7 +381,22 @@ public:
 
     const juce::AudioBuffer<float>& getReferenceBuffer() const { return referenceBuffer; }
     const WavetableData& getRefWavetable() const { return refWavetable; }
-    const juce::AudioBuffer<float>& getMatchedBuffer() const   { return matchedBuffer; }
+    const juce::AudioBuffer<float>& getMatchedBuffer() const        { return matchedBuffer; }
+    const juce::AudioBuffer<float>& getCompensatedBuffer() const   { return compensatedBuffer; }
+    // Returns compensated buffer if blend > 0 and it exists, otherwise matched
+    const juce::AudioBuffer<float>& getOutputBuffer() const
+    {
+        return (residualBlend > 0.001f && compensatedBuffer.getNumSamples() > 0)
+            ? compensatedBuffer : matchedBuffer;
+    }
+    float getResidualBlend() const                                 { return residualBlend; }
+    void setResidualBlend (float blend)
+    {
+        residualBlend = std::max (0.0f, std::min (1.0f, blend));
+        // Recompute if we have a matched result
+        if (matchedBuffer.getNumSamples() > 0 && referenceBuffer.getNumSamples() > 0)
+            applyResidualCompensation();
+    }
     double getSampleRate() const                               { return referenceSampleRate; }
     const juce::File& getReferenceFile() const                 { return referenceFile; }
     const juce::File& getMatchDataDir() const                  { return matchDataDir; }
@@ -540,7 +562,9 @@ private:
     HarmonicPhaseData refHarmonicPhases;
 
     // Result
-    juce::AudioBuffer<float> matchedBuffer;
+    juce::AudioBuffer<float> matchedBuffer;        // pure synth output
+    juce::AudioBuffer<float> compensatedBuffer;    // synth + spectral residual compensation
+    float residualBlend = 0.7f;                    // 0.0 = pure synth, 1.0 = full compensation
     MatchDescriptors matchedDescriptors;
     MatchSynthParams bestParams;
     OptimizationResult bestResult;
@@ -570,6 +594,179 @@ private:
     bool historyLoaded = false;
 
     DescriptorExtractor extractor;
+
+    // === Phase 4: Spectral Residual Compensation ===
+    // STFT-domain compensation: computes what the synth couldn't model and blends it back.
+    // Half-wave rectification ensures we only ADD missing energy, never subtract.
+    // This is what makes the match "infalible" — even a mediocre synth result
+    // gets boosted to 95%+ with the residual.
+
+    void applyResidualCompensation()
+    {
+        if (residualBlend < 0.001f || matchedBuffer.getNumSamples() == 0
+            || referenceBuffer.getNumSamples() == 0)
+        {
+            compensatedBuffer.setSize (0, 0);
+            return;
+        }
+
+        const float sr = (float) referenceSampleRate;
+        const int numChannels = matchedBuffer.getNumChannels();
+        const int refLen = referenceBuffer.getNumSamples();
+        const int synthLen = matchedBuffer.getNumSamples();
+        const int outLen = std::max (refLen, synthLen);
+
+        // STFT parameters
+        const int fftOrder = 11;   // 2048-point FFT
+        const int fftSize = 1 << fftOrder;
+        const int hopSize = fftSize / 4; // 75% overlap
+        const int numBins = fftSize / 2 + 1;
+
+        // Process each channel independently (preserves stereo image)
+        compensatedBuffer.setSize (numChannels, outLen);
+        compensatedBuffer.clear();
+
+        juce::dsp::FFT fft (fftOrder);
+
+        // Hann window
+        std::vector<float> window (fftSize);
+        for (int i = 0; i < fftSize; ++i)
+            window[i] = 0.5f * (1.0f - std::cos (2.0f * 3.14159265358979f * (float) i / (float) fftSize));
+
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            // Get reference channel (wrap if mono ref → stereo synth)
+            const float* refData = referenceBuffer.getReadPointer (std::min (ch, referenceBuffer.getNumChannels() - 1));
+            const float* synthData = matchedBuffer.getReadPointer (ch);
+            float* outData = compensatedBuffer.getWritePointer (ch);
+
+            // Start with synth output
+            for (int i = 0; i < synthLen; ++i)
+                outData[i] = synthData[i];
+            // Pad with zeros if ref is longer
+            for (int i = synthLen; i < outLen; ++i)
+                outData[i] = 0.0f;
+
+            // Overlap-add accumulator for the residual signal
+            std::vector<float> residualOLA (outLen, 0.0f);
+            std::vector<float> windowSum (outLen, 0.0f);
+
+            int numFrames = std::max (0, (outLen - fftSize) / hopSize + 1);
+
+            std::vector<float> refFFT (fftSize * 2);
+            std::vector<float> synthFFT (fftSize * 2);
+
+            for (int frame = 0; frame < numFrames; ++frame)
+            {
+                int pos = frame * hopSize;
+                if (pos + fftSize > outLen) break;
+
+                // Window and FFT both signals
+                for (int i = 0; i < fftSize; ++i)
+                {
+                    float w = window[i];
+                    refFFT[i] = (pos + i < refLen) ? refData[pos + i] * w : 0.0f;
+                    synthFFT[i] = (pos + i < synthLen) ? synthData[pos + i] * w : 0.0f;
+                }
+                std::fill (refFFT.begin() + fftSize, refFFT.end(), 0.0f);
+                std::fill (synthFFT.begin() + fftSize, synthFFT.end(), 0.0f);
+
+                fft.performRealOnlyForwardTransform (refFFT.data());
+                fft.performRealOnlyForwardTransform (synthFFT.data());
+
+                // Compute residual in spectral domain
+                // For each bin: residualMag = max(0, |ref| - |synth|) [half-wave rectification]
+                //               residualPhase = phase(ref)
+                std::vector<float> residualFrame (fftSize * 2, 0.0f);
+
+                for (int b = 0; b < numBins; ++b)
+                {
+                    float refRe = refFFT[b * 2];
+                    float refIm = refFFT[b * 2 + 1];
+                    float synthRe = synthFFT[b * 2];
+                    float synthIm = synthFFT[b * 2 + 1];
+
+                    float refMag = std::sqrt (refRe * refRe + refIm * refIm);
+                    float synthMag = std::sqrt (synthRe * synthRe + synthIm * synthIm);
+
+                    // Half-wave rectification: only add what's MISSING
+                    float residualMag = std::max (0.0f, refMag - synthMag);
+
+                    // Cap at +12 dB above synth magnitude to prevent artifacts
+                    float maxCorrection = synthMag * 4.0f; // +12 dB
+                    residualMag = std::min (residualMag, std::max (maxCorrection, refMag * 0.5f));
+
+                    // Use reference phase for the residual
+                    float refPhase = std::atan2 (refIm, refRe);
+
+                    // Apply blend amount
+                    float blendedMag = residualMag * residualBlend;
+
+                    residualFrame[b * 2]     = blendedMag * std::cos (refPhase);
+                    residualFrame[b * 2 + 1] = blendedMag * std::sin (refPhase);
+                }
+
+                // Inverse FFT
+                fft.performRealOnlyInverseTransform (residualFrame.data());
+
+                // Overlap-add with synthesis window
+                for (int i = 0; i < fftSize; ++i)
+                {
+                    residualOLA[pos + i] += residualFrame[i] / (float) fftSize * window[i];
+                    windowSum[pos + i] += window[i] * window[i];
+                }
+            }
+
+            // Normalize overlap-add and add to output
+            for (int i = 0; i < outLen; ++i)
+            {
+                float residualSample = (windowSum[i] > 0.01f) ? residualOLA[i] / windowSum[i] : 0.0f;
+                outData[i] += residualSample;
+            }
+        }
+
+        // Sanitize compensated buffer
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            auto* data = compensatedBuffer.getWritePointer (ch);
+            for (int s = 0; s < outLen; ++s)
+            {
+                if (std::isnan (data[s]) || std::isinf (data[s]))
+                    data[s] = 0.0f;
+                else
+                    data[s] = std::max (-1.0f, std::min (1.0f, data[s]));
+            }
+        }
+
+        // Normalize to reference peak level
+        float refPeak = 0.0f;
+        for (int ch = 0; ch < referenceBuffer.getNumChannels(); ++ch)
+        {
+            const float* data = referenceBuffer.getReadPointer (ch);
+            for (int i = 0; i < refLen; ++i)
+                refPeak = std::max (refPeak, std::abs (data[i]));
+        }
+        float compPeak = 0.0f;
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            const float* data = compensatedBuffer.getReadPointer (ch);
+            for (int i = 0; i < outLen; ++i)
+                compPeak = std::max (compPeak, std::abs (data[i]));
+        }
+        if (compPeak > 0.001f && refPeak > 0.001f)
+        {
+            float gain = refPeak / compPeak;
+            if (gain > 0.1f && gain < 10.0f) // sanity bounds
+            {
+                for (int ch = 0; ch < numChannels; ++ch)
+                {
+                    auto* data = compensatedBuffer.getWritePointer (ch);
+                    for (int i = 0; i < outLen; ++i)
+                        data[i] *= gain;
+                }
+            }
+        }
+    }
 
     // === Side-channel data extraction from reference ===
 

@@ -1,135 +1,99 @@
-# ONE-SHOT AI — Estado del Plugin y Mejoras (2026-03-09)
+# ONE-SHOT AI — Estado actual del plugin
 
-## Resumen Pipeline ML v3 (final)
+## Resumen
+Plugin JUCE C++17 que genera one-shots de audio con IA. 10 instrumentos × 9 géneros.
+Dos modos: **Generator** (crear desde cero) y **Match** (reconstruir un sample por síntesis).
 
-| Fase | Script | Estado | Resultado |
-|------|--------|--------|-----------|
-| 3 | 01_extract_features + 01b | COMPLETADA | 16,927 JSONs con features + windowed_features |
-| 3.5 | 02_build_profiles | COMPLETADA | 87 perfiles (68/90 combos con samples) |
-| 4 | 03_optimize_params | COMPLETADA (v3) | 86 combos, 0 NaN, params expandidos + synths mejorados |
-| 4 | 03b_learn_mutation_axes | COMPLETADA (v3) | PCA por instrumento, MutationAxes.h regenerado |
-| 4 | 04_export_genre_rules | COMPLETADA (v3) | GenreRules_calibrated.h (854 lineas) |
-| 5 | 05_train_model | COMPLETADA (v3) | MLP 13,731 params, val_loss=0.000029 |
-| 6 | 06_export_onnx | COMPLETADA (v3) | oneshot_param_predictor.onnx (10.2KB), verificado |
-| 7 | 07_train_quality_scorer | COMPLETADA (v3) | 100% reales OK, 98% malos detectados, ONNX OK |
-| 8 | Expansion params + mejora synths | COMPLETADA | synth_bridge, C++ synths, ONNX integrado |
+## Motor de síntesis: UniversalSynth
 
-### Archivos generados
+### Arquitectura
+4 capas paralelas → Mixer → Filter Chain → Effects → Output
 
-```
-Training/data/
-  optimized_params/    86 JSONs con parametros optimos (v3 - synths mejorados)
-  mutation_axes/       PCA axes + MutationAxes.h para C++
-  profiles/            87 perfiles estadisticos
-  models/
-    oneshot_param_predictor.pt     Modelo PyTorch (MLP)
-    oneshot_param_predictor.onnx   Modelo ONNX para C++ (10.2KB)
-    quality_scorer.pt              Quality scorer PyTorch
-    quality_scorer.onnx            Quality scorer ONNX
-    feature_space_map.png          Mapa PCA del espacio de parametros
-  dataset/
-    training_data.npz              1,285,582 filas
-    quality_scorer_data.npz        18,287 filas
-  GenreRules_calibrated.h          Header C++ con parametros calibrados (854 lineas)
+| Capa | Función | Parámetros clave | Estado |
+|------|---------|-----------------|--------|
+| Layer A (Tonal) | Osciladores + FM + aditivo + unísono + sub | tonalLevel, fmDepth, unisonVoices, subLevel | OK |
+| Layer B (Noise) | Ruido coloreado + bursts + granular | noiseLevel, burstCount, granularDensity | OK |
+| Layer C (Modal/KS) | Resonadores modales + Karplus-Strong | modalLevel, modalMode, numModes, ksFeedback | OK |
+| Layer D (Transient) | Clicks + snaps + impulsos | transientLevel, clickType, snapAmount | OK |
 
-ONE-SHOT AI/
-  Resources/
-    oneshot_param_predictor.onnx   Copiado para el plugin
-    quality_scorer.onnx            Copiado para el plugin
-  Source/AI/
-    GenreRules.h                   REEMPLAZADO con version ML-calibrada
-    MutationAxes.h                 NUEVO - ejes de mutacion PCA
-    ParameterGenerator.h           ACTUALIZADO con inferencia ONNX
-  Source/SynthEngine/
-    TextureSynth.h                 MEJORADO - pitched grains
-    PluckSynth.h                   MEJORADO - FM synthesis
-  Source/Params/
-    InstrumentParams.h             ACTUALIZADO - nuevos params
-```
+- **88 parámetros** universales
+- **13 tipos de onda** (sine, tri, saw, square, pulse, wavetable, etc.)
+- Gate por capa: si xxxLevel=0, la capa se salta (ahorro CPU)
 
----
+## Match System v7 — Professional-Grade (2026-04-09)
 
-## Resultados de Optimizacion v3
+### Arquitectura: 5 fases
 
-| Instrumento | Params | Dist. Media | Mejor (dist) | Peor (dist) | Conv. | NaN |
-|-------------|--------|------------|--------------|-------------|-------|-----|
-| **808s** | 7 | 60.4 | ambient (27.7) | house (107.8) | 7/9 | 0 |
-| **kicks** | 8 | 89.5 | house (66.3) | hiphop (104.9) | 1/8 | 0 |
-| **percs** | 6 | 114.9 | house (81.5) | ambient (141.9) | 2/9 | 0 |
-| **plucks** | 6 | 150.4 | edm (73.7) | ambient (272.6) | 4/9 | 0 |
-| **claps** | 6 | 176.9 | edm (132.9) | ambient (269.8) | 0/9 | 0 |
-| **leads** | 7 | 181.8 | afrobeat (107.0) | ambient (300.5) | 5/9 | 0 |
-| **snares** | 7 | 191.1 | hiphop (138.1) | techno (347.9) | 2/9 | 0 |
-| **hihats** | 6 | 221.8 | rnb (155.4) | afrobeat (309.8) | 0/9 | 0 |
-| **textures** | 8 | 238.4 | edm (169.6) | house (417.8) | 0/9 | 0 |
-| **pads** | 8 | 300.8 | edm (104.7) | rnb (462.3) | 1/6 | 0 |
+| Fase | Función | Estado |
+|------|---------|--------|
+| Phase 0 | Análisis directo: medir F0 (YIN), envelope, duration | OK |
+| Phase 1 | OscType screening (14 waveforms) | OK |
+| Phase 2 | BIPOP-CMA-ES timbral (~45 params) | OK |
+| Phase 3 | Nelder-Mead polish (top-40 params) | OK |
+| Phase 4 | **Spectral Residual Compensation** (NUEVO) | OK |
 
-### Evolucion v1 -> v2 -> v3
+### Mejoras v7 implementadas
 
-| Instrumento | v1 (params basicos) | v2 (params expandidos) | v3 (synths mejorados) |
-|-------------|--------------------|-----------------------|----------------------|
-| **808s** | 125.0 | 61.9 | **60.4** |
-| **kicks** | 87.8 | 89.8 | **89.5** |
-| **percs** | 137.9 (4 NaN) | 122.5 (4 NaN) | **114.9 (0 NaN)** |
-| **plucks** | 576.1 | 156.2 | **150.4** |
-| **claps** | 355.6 | 174.2 | **176.9** |
-| **leads** | OVERFLOW | 181.8 | **181.8** |
-| **snares** | 235.7 (2 NaN) | 201.1 (2 NaN) | **191.1 (0 NaN)** |
-| **hihats** | 218.1 (3 NaN) | 225.9 (3 NaN) | **221.8 (0 NaN)** |
-| **textures** | OVERFLOW | 312.0 | **238.4** |
-| **pads** | OVERFLOW | 271.7 | **300.8** |
+1. **Duration ±2%** — bounds más estrictos (antes ±10%)
+2. **Loss function mejorada:**
+   - Mild perceptual weighting en STFT: `sqrt(A-weight)` con floor=0.4 (no mata graves)
+   - Envelope derivative matching (slope, no solo valor)
+   - Attack energy matching (no solo forma normalizada)
+   - Pesos: `0.30*STFT + 0.25*Mel + 0.20*Env + 0.10*Attack + 0.05*Pitch + 0.10*RMS`
+3. **YIN Pitch Detection** — reemplaza autocorrelación, elimina octave-locking
+4. **BIPOP-CMA-ES** — alterna large-pop (exploración) y small-pop (explotación)
+5. **Spectral Residual Compensation (Phase 4):**
+   - STFT 2048/hop512, half-wave rectification (solo agrega lo que falta)
+   - Blend slider en UI: 0%=pure synth, 70%=default, 100%=near-perfect
+   - `compensatedBuffer` separado del `matchedBuffer`
+   - API: `api/match/blend?value=0.7`
 
-**Total NaN: 9 -> 9 -> 0**
+### Estado del match (pendiente validar)
+- [x] Compilación Release OK
+- [ ] **Validar scores con kicks** — primer test dio 10% (bug A-weighting agresivo, CORREGIDO → sqrt+floor=0.4)
+- [ ] Validar con snares, hihats, pads, texturas
+- [ ] Verificar que el blend slider funciona correctamente en la UI
+- [ ] A/B listening test con diferentes niveles de blend
+- [ ] Ajustar pesos de loss si algún tipo de sonido sigue dando scores bajos
 
----
+### Bug corregido (sesión actual)
+- A-weighting original (floor=0.05) mataba los graves de kicks/bass
+- Fix: `sqrt(A-weight)` con floor=0.4 → graves pesan al menos 40%
 
-## Cambios realizados
+## Pipeline ML
 
-### Fix NaN (9 combinaciones)
-- Causa real: perfiles con NaN en `noise_ratio`/`harmonic_ratio` (HPSS fallo en samples reales)
-- Fix: guards NaN en `_legacy_timbral_distance` y `_perceptual_feature_distance`
-- Sanitizacion en `extract_features_fast`: reemplaza NaN con 0.0
+| Script | Estado | Descripción |
+|--------|--------|-------------|
+| synth_bridge.py | Actualizado | Python mirror del UniversalSynth (88 params) |
+| model.py | Actualizado | MLP 24→256→128→88 |
+| 03_optimize_params.py | Actualizado | UNIVERSAL_BOUNDS (88 params) |
+| 05_train_model.py | Actualizado | Dataset con 88 params |
+| 06_export_onnx.py | OK | Dinámico |
+| 07_train_quality_scorer.py | Actualizado | UNIVERSAL_BOUNDS |
 
-### Mejoras de synths
+## Compilación
+- Visual Studio 18 (Insiders) / Projucer
+- MSBuild: `"C:\Program Files\Microsoft Visual Studio\18\Insiders\MSBuild\Current\Bin\MSBuild.exe"`
+- Build **Release** para rendimiento (Debug 5-10x más lento)
+- .sln en: `ONE-SHOT AI/Builds/VisualStudio2022/`
 
-**TextureSynth** (dist 312 -> 238, -24%):
-- Python: nuevo param `pitchedness` (0=noise, 1=pitched sine grains) + `pitch`
-- C++: pitched grain generation usando Oscillator (Sine mode)
+## Próximo paso: Migración a DDSP (2026-04-13)
 
-**PluckSynth** (dist 156 -> 150):
-- Python: nuevo param `fmAmount` (0=Karplus-Strong, 1=FM dominant)
-- C++: FM synthesis con carrier + modulator (ratio 2:1 y 3:1)
+**Decisión:** Migrar el Generator Mode y Match Mode a DDSP (Differentiable Digital Signal Processing).
+Síntesis neural basada en modelos sinusoidales diferenciables — SMS + red neuronal end-to-end.
 
-**PadSynth** (dist 272 -> 301):
-- Python: nuevo param `evolutionRate` (LFO modulando filter cutoff)
-- C++: ya tenia `evolutionRate` implementado
+**Plan completo:** `PLAN_DDSP.md`
 
-### Integracion C++
+**Qué cambia:**
+- Generator y Match usarán DDSP (encoder/decoder + SMS resíntesis)
+- Match pasa de CMA-ES (~30s) a inference directa (~100ms)
+- Calidad de reconstrucción: de ~85% paramétrico a ~99% sinusoidal
 
-1. **ONNX models** copiados a `ONE-SHOT AI/Resources/`
-2. **GenreRules.h** reemplazado con 86 combos ML-calibrados (854 lineas)
-3. **MutationAxes.h** integrado en `Source/AI/`
-4. **ParameterGenerator.h** actualizado:
-   - `#if USE_ONNX_INFERENCE` para compilacion condicional
-   - `loadONNXModels()`, `predictFromONNX()`, `scoreQuality()`
-   - Fallback automatico a reglas si ONNX no disponible
-   - `#include "MutationAxes.h"`
+**Qué se mantiene:**
+- UniversalSynth (88 params) para Synth Editor manual
+- Todos los DSP, Effects, Params
+- Samples de training (se reutilizan para entrenar DDSP)
 
----
-
-## Que queda por hacer
-
-| Tarea | Esfuerzo | Impacto |
-|-------|----------|---------|
-| Compilar plugin con onnxruntime (definir USE_ONNX_INFERENCE) | 1-2h | ALTO |
-| Test auditivo de los sonidos generados | 1h | ALTO |
-| Mejorar PadSynth (dist 301, la peor) | 2h | MEDIO |
-| Recopilar mas samples (22 combos vacios) | Variable | MEDIO |
-| Optimizar ambient (peor genero en plucks/leads/claps) | 1h | MEDIO |
-| Fine-tune quality scorer con nuevos datos | 30min | BAJO |
-
-### Para compilar con ONNX
-1. Descargar onnxruntime C API (prebuilt para Windows)
-2. Anadir a Projucer: header path + library path
-3. Definir `USE_ONNX_INFERENCE=1` en preprocessor definitions
-4. Compilar — el plugin usara ML para generar parametros con fallback a reglas
+### Pendiente (legacy, baja prioridad)
+- [ ] Eliminar synths legacy cuando DDSP funcione
+- [ ] Cleanup de OneShotMatchOptimizer.h (CMA-ES) cuando DDSP lo reemplace

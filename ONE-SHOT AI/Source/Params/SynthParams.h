@@ -6,12 +6,12 @@
 #include "InstrumentParams.h"
 #include "GenerationRequest.h"
 #include "../Effects/EffectParams.h"
+#include "../UniversalSynth/UniversalSynthParams.h"
 
 #include <variant>
 
-// Variante que contiene los parámetros específicos de cualquier instrumento.
-// Permite pasar un único tipo que represente el resultado de la generación
-// sin importar qué instrumento se haya seleccionado.
+// Legacy variant type — kept for backward compatibility with old code paths.
+// New code should use UniversalSynthParams directly.
 using InstrumentParamsVariant = std::variant<
     KickParams,
     SnareParams,
@@ -25,11 +25,12 @@ using InstrumentParamsVariant = std::variant<
     TextureParams
 >;
 
-// Resultado completo de la generación: contiene los parámetros específicos
-// del instrumento listos para ser procesados por el motor de síntesis.
+// Resultado completo de la generación: contiene los parámetros universales
+// del sintetizador listos para ser procesados por el motor de síntesis.
 struct GenerationResult
 {
-    InstrumentType          instrument;
-    InstrumentParamsVariant params;
-    EffectChainParams       effects;   // Fase 4: cadena de efectos DSP
+    InstrumentType                      instrument;
+    universalsynth::UniversalSynthParams universalParams;  // New: universal synth params
+    InstrumentParamsVariant             legacyParams;      // Legacy: kept for backward compat
+    EffectChainParams                   effects;
 };

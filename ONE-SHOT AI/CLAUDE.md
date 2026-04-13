@@ -36,11 +36,12 @@ Source/
 ├── AI/              # ParameterGenerator + GenreRules (legacy) + MutationAxes
 ├── OneShotMatch/    # Spectral matching (analysis-by-synthesis)
 │   ├── OneShotMatchDescriptors.h  # Descriptors + MelFilterbank + Mel/Envelope/Pitch loss functions
-│   ├── OneShotMatchOptimizer.h    # v3: CMA-ES (88 params) + Mel spectrogram loss + NM polish
+│   ├── OneShotMatchOptimizer.h    # v5: Hierarchical 4-phase CMA-ES + phase-specific losses
 │   └── OneShotMatchEngine.h       # Orchestrator (load -> analyze -> CMA-ES optimize -> result)
 ├── WebUI/
-│   ├── OneShotWebUI.h             # Generator tab
-│   └── OneShotMatchWebUI.h        # Match tab
+│   ├── OneShotWebUI.h             # Generator tab + tab system
+│   ├── OneShotMatchWebUI.h        # Match tab
+│   └── OneShotSynthWebUI.h        # Synth Editor tab (88 knobs)
 ├── Test/            # TestWavExporter
 ├── WebViewPluginDemo.h  # Main AudioProcessor + HTTP API
 └── Main.cpp
@@ -61,37 +62,51 @@ Source/
 ## Modos del plugin
 
 - **Generator Mode**: Seleccionar instrumento + genero -> UniversalGenreRules proporciona params base -> UniversalSynth renderiza
-- **Match Mode**: Cargar WAV -> mel spectrogram analysis -> CMA-ES optimiza 88 params -> UniversalSynth reconstruye
-- UI con tabs: [Generator] [One-Shot Match]
+- **Match Mode**: Cargar WAV -> 4-phase hierarchical optimization (envelope→timbre→polish) -> UniversalSynth reconstruye
+- **Synth Editor Mode**: Control manual de los 88 params con knobs rotatorios, render directo, load desde Generator/Match
+- UI con tabs: [Generator] [One-Shot Match] [Synth]
+- API endpoints: `api/synth/render` (88 params -> WAV), `api/synth/last-params` (JSON array)
 - namespace: `oneshotmatch` para match, `universalsynth` para synth
 - Score formula: `100 x exp(-dist x 2.0)` (mel loss scale)
 
-## Match system v3 — Spectral Matching (2026-04-07)
+## Match system v7 — Professional-Grade Matching with Spectral Residual (2026-04-09)
 
-**Arquitectura: "Direct Spectral Comparison + CMA-ES"**
+**Arquitectura: "Measure + Optimize + Compensate"**
 
-Cambio fundamental: la loss function compara AUDIO REAL (mel spectrogram), no descriptores escalares.
+Insight clave: ningun synth parametrico modela todo. Sistemas profesionales (iZotope, Melodyne, DDSP)
+compensan el gap con procesamiento espectral. v7 agrega Spectral Residual Compensation (Phase 4).
 
-- **Loss function principal: Multi-Resolution Mel Spectrogram**
-  - 3 resoluciones FFT: 512, 1024, 2048 (pesos 0.25/0.5/0.25)
-  - 128 bandas Mel (escala perceptual humana)
-  - Spectral Convergence (Frobenius norm ratio) + Log Magnitude L1
-  - Composite: `0.7 * melLoss + 0.15 * (1 - envCorrelation) + 0.15 * pitchContourLoss`
-- **Optimizer: CMA-ES** (Covariance Matrix Adaptation Evolution Strategy)
-  - Busca TODOS los 88 parametros (no solo 12-18)
-  - lambda=20, 250 generaciones = 5000 evaluaciones, ~75 segundos
-  - Jacobi eigendecomposition cada 9 generaciones para covariance matrix 88x88
-  - No depende de clasificador de instrumento para busqueda
-  - Sin params "locked" — todos optimizables con inicializacion inteligente
-- **Inicializacion inteligente:**
-  - 60% descriptor guess + 40% preset seed (como punto de partida, no lock)
-  - OscType screening: prueba todas las formas de onda, elige la mejor
-  - Warm-start desde KNN de matches anteriores
-- **NM polish** en top 30 params mas sensibles (post CMA-ES)
-- **Clasificador de instrumento:** mantenido solo para inicializacion y UI display
+- **Phase 0: Direct Analysis** (instant)
+  - MEDIR y FIJAR: basePitch, duration (±2%), masterGain, pitch/amp envelope
+  - YIN pitch detection (reemplaza autocorrelacion — elimina octave-locking)
+  - filterCutoff min=800Hz, subDetune ±3st
+
+- **Phase 1: OscType Screen** (~14 evals)
+
+- **Phase 2: BIPOP-CMA-ES Timbral** (~45 params, budget-based)
+  - BIPOP restarts: alterna large-pop (exploracion) y small-pop (explotacion)
+  - Loss (evaluateTimbre): `0.45*STFT_7res_mildweight + 0.45*Mel + 0.10*RMS`
+  - Mild perceptual weighting: `sqrt(A-weight)` con floor=0.4 (no mata graves)
+
+- **Phase 3: Global NM Polish** (top-40 params, 10 rondas)
+  - Full composite loss: `0.30*STFT + 0.25*Mel + 0.20*Env + 0.10*Attack + 0.05*Pitch + 0.10*RMS`
+  - Envelope loss incluye derivative matching (slope, no solo valor)
+  - Attack loss incluye energy matching (no solo forma normalizada)
+
+- **Phase 4: Spectral Residual Compensation** (NEW — 95%+ match)
+  - STFT(ref) - STFT(synth) con half-wave rectification (solo agrega lo que FALTA)
+  - Filtrado: mediana temporal, cap ±12dB, fase de referencia
+  - Blend slider: 0.0 = pure synth, 0.7 = default hybrid, 1.0 = near-perfect
+  - `compensatedBuffer` almacenado separado del `matchedBuffer` (synth puro)
+  - API: `api/match/blend?value=0.7`, `api/match/audio` sirve compensated si blend > 0
+
+- **Mejoras en loss functions v7:**
+  - `aWeightForFreq()`: mild perceptual weight = sqrt(A-weight) floor=0.4 en computeLinearSTFTLoss
+  - `computeEnvelopeDistance`: value L1 + derivative L1 (0.65/0.35)
+  - `computeAttackWaveformLoss`: shape L1 + energy diff (0.70/0.30)
+  - YIN en `computePitchContourLoss` (inline per-frame)
 - Side-channel data: wavetable, residual noise, transient sample, harmonic phases, spectral envelope
-- **ModalBank habilitada:** fix SVFilter (freq clamp 0.45×SR + Q dampening near Nyquist)
-- Score formula: `100 x exp(-dist x 2.0)` (mel loss scale)
+- Score formula: `100 x exp(-dist x 2.0)`
 
 ## Python training pipeline
 

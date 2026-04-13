@@ -7,6 +7,7 @@
 #include "../Params/SynthParams.h"
 #include "GenreRules.h"
 #include "MutationAxes.h"
+#include "../UniversalSynth/UniversalGenreRules.h"
 
 // ================================================================
 // ONNX Runtime inference support (conditional compilation)
@@ -101,7 +102,7 @@ public:
             // Try ONNX inference, fall back to rules on failure
             try
             {
-                result.params = generateFromONNX (req, rng);
+                result.legacyParams = generateFromONNX (req, rng);
                 result.effects = generateEffects (req, rng);
                 return result;
             }
@@ -115,20 +116,23 @@ public:
         // Rule-based generation (original path)
         switch (req.instrument)
         {
-            case InstrumentType::Kick:    result.params = generateKick (req, rng);    break;
-            case InstrumentType::Snare:   result.params = generateSnare (req, rng);   break;
-            case InstrumentType::HiHat:   result.params = generateHiHat (req, rng);   break;
-            case InstrumentType::Clap:    result.params = generateClap (req, rng);     break;
-            case InstrumentType::Perc:    result.params = generatePerc (req, rng);     break;
-            case InstrumentType::Bass808: result.params = generateBass808 (req, rng);  break;
-            case InstrumentType::Lead:    result.params = generateLead (req, rng);     break;
-            case InstrumentType::Pluck:   result.params = generatePluck (req, rng);    break;
-            case InstrumentType::Pad:     result.params = generatePad (req, rng);      break;
-            case InstrumentType::Texture: result.params = generateTexture (req, rng);  break;
+            case InstrumentType::Kick:    result.legacyParams = generateKick (req, rng);    break;
+            case InstrumentType::Snare:   result.legacyParams = generateSnare (req, rng);   break;
+            case InstrumentType::HiHat:   result.legacyParams = generateHiHat (req, rng);   break;
+            case InstrumentType::Clap:    result.legacyParams = generateClap (req, rng);     break;
+            case InstrumentType::Perc:    result.legacyParams = generatePerc (req, rng);     break;
+            case InstrumentType::Bass808: result.legacyParams = generateBass808 (req, rng);  break;
+            case InstrumentType::Lead:    result.legacyParams = generateLead (req, rng);     break;
+            case InstrumentType::Pluck:   result.legacyParams = generatePluck (req, rng);    break;
+            case InstrumentType::Pad:     result.legacyParams = generatePad (req, rng);      break;
+            case InstrumentType::Texture: result.legacyParams = generateTexture (req, rng);  break;
         }
 
         // Fase 4: generar parámetros de efectos
         result.effects = generateEffects (req, rng);
+
+        // Generate UniversalSynth params via universal genre rules
+        result.universalParams = universalsynth::genrerules::getBase (req.instrument, req.genre);
 
         return result;
     }
